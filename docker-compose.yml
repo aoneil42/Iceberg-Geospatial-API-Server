@@ -1,0 +1,53 @@
+services:
+
+  pygeoapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.pygeoapi
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./config/pygeoapi-config.yml:/app/config/pygeoapi-config.yml:ro
+      - ./config/catalog.yml:/app/config/catalog.yml:ro
+      - iceberg-warehouse:/data/warehouse
+    environment:
+      - PYGEOAPI_CONFIG=/app/config/pygeoapi-config.yml
+      - ICEBERG_CATALOG_CONFIG=/app/config/catalog.yml
+      - PYGEOAPI_OPENAPI=/app/config/openapi.yml
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  geoservices:
+    build:
+      context: .
+      dockerfile: Dockerfile.geoservices
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./config/catalog.yml:/app/config/catalog.yml:ro
+      - iceberg-warehouse:/data/warehouse
+    environment:
+      - ICEBERG_CATALOG_CONFIG=/app/config/catalog.yml
+      - GEOSERVICES_HOST=0.0.0.0
+      - GEOSERVICES_PORT=8001
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/rest/info')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  rest-catalog:
+    image: apache/iceberg-rest:1.9.0
+    ports:
+      - "8181:8181"
+    environment:
+      - CATALOG_WAREHOUSE=file:///data/warehouse
+      - CATALOG_IO__IMPL=org.apache.iceberg.io.FileIO
+    volumes:
+      - iceberg-warehouse:/data/warehouse
+
+volumes:
+  iceberg-warehouse:

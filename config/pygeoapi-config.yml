@@ -1,0 +1,77 @@
+server:
+    bind:
+        host: 0.0.0.0
+        port: 5000
+    url: http://localhost:5000
+    mimetype: application/json; charset=UTF-8
+    encoding: utf-8
+    gzip: true
+    languages:
+        - en-US
+    cors: true
+
+logging:
+    level: INFO
+
+metadata:
+    identification:
+        title: Iceberg Geospatial API
+        description: OGC API Features backed by Apache Iceberg
+        keywords:
+            - iceberg
+            - geospatial
+            - ogc api
+        keywords_type: theme
+        terms_of_service: null
+        url: https://github.com/your-org/iceberg-geo-api
+    license:
+        name: Apache-2.0
+        url: https://www.apache.org/licenses/LICENSE-2.0
+    provider:
+        name: Your Organization
+        url: https://your-org.com
+    contact:
+        name: Admin
+        email: admin@your-org.com
+
+resources:
+    example-parcels:
+        type: collection
+        title: Parcels
+        description: National parcel boundaries from Iceberg
+        keywords:
+            - parcels
+            - boundaries
+        extents:
+            spatial:
+                bbox: [-180, -90, 180, 90]
+                crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+        providers:
+            - type: feature
+              name: iceberg_geo.pygeoapi_provider.iceberg.IcebergProvider
+              data: default.parcels
+              id_field: parcel_id
+              options:
+                  geometry_column: geometry
+
+    example-sensors:
+        type: collection
+        title: Sensor Observations
+        description: Environmental sensor readings
+        keywords:
+            - sensors
+            - observations
+        extents:
+            spatial:
+                bbox: [-180, -90, 180, 90]
+                crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+            temporal:
+                begin: 2020-01-01T00:00:00Z
+                end: null
+        providers:
+            - type: feature
+              name: iceberg_geo.pygeoapi_provider.iceberg.IcebergProvider
+              data: default.sensor_observations
+              id_field: observation_id
+              options:
+                  geometry_column: location

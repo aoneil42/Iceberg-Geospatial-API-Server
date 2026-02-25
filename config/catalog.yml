@@ -1,0 +1,20 @@
+# PyIceberg catalog configuration.
+# See: https://py.iceberg.apache.org/configuration/
+
+catalog:
+    name: default
+    type: rest
+    uri: http://rest-catalog:8181
+
+# For local dev with SQLite catalog:
+# catalog:
+#     name: default
+#     type: sql
+#     uri: sqlite:////data/warehouse/catalog.db
+#     warehouse: file:///data/warehouse
+
+# For AWS Glue:
+# catalog:
+#     name: default
+#     type: glue
+#     warehouse: s3://your-bucket/warehouse
