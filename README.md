@@ -1,170 +1,311 @@
 # Spatial Lakehouse
 
-A containerized geospatial data lakehouse for local development on Apple Silicon, designed for eventual migration to production S3 and as the foundation for an interactive geospatial AI interface.
+A containerized geospatial data lakehouse with three API interfaces (Esri GeoServices, OGC API Features, GeoParquet), a deck.gl webmap, and Apache Iceberg table storage. Built for local development on Apple Silicon with a clear path to AWS deployment.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Your AI Interface                     │
-│              (generates SQL, calls DuckDB)               │
-└────────────────────────┬────────────────────────────────┘
-                         │ SQL
-          ┌──────────────┴──────────────┐
-          │                             │
-  ┌───────▼────────┐          ┌────────▼─────────┐
-  │   DuckDB +     │          │  SedonaSpark     │
-  │   Spatial +    │          │  (heavy profile) │
-  │   Iceberg ext  │          │  ETL · raster ·  │
-  │                │          │  maintenance     │
-  │  interactive   │          │  batch jobs      │
-  └───────┬────────┘          └────────┬─────────┘
-          │ REST                       │ REST
-          └──────────┬─────────────────┘
-                     │
-           ┌─────────▼──────────┐
-           │    LakeKeeper      │
-           │  Iceberg REST      │──── PostgreSQL
-           │  Catalog           │     (metadata)
-           └─────────┬──────────┘
-                     │ S3 API
-           ┌─────────▼──────────┐
-           │      Garage        │
-           │  S3-compatible     │
-           │  object storage    │
-           └────────────────────┘
-           (swap to real S3 later)
+                         ┌──────────────────────────────────────┐
+                         │          nginx (port 3000)           │
+                         │    reverse proxy + URL rewriting     │
+                         └──┬───────┬───────┬───────┬──────────┘
+                            │       │       │       │
+                   /ogc/    │  /api/ │ /esri/ │  /   │
+                            │       │       │       │
+              ┌─────────────▼┐  ┌───▼───┐  ┌▼──────▼──────────┐
+              │   pygeoapi   │  │FastAPI│  │  Esri GeoServices │
+              │  OGC API     │  │DuckDB │  │  FeatureServer    │
+              │  Features    │  │       │  │  PBF + JSON       │
+              │  port 5000   │  │  8000 │  │  port 8001        │
+              └──────┬───────┘  └───┬───┘  └────────┬──────────┘
+                     │              │               │
+                     └──────────────┼───────────────┘
+                                    │
+                          ┌─────────▼──────────┐
+                          │    LakeKeeper      │
+                          │  Iceberg REST      │──── PostgreSQL
+                          │  Catalog (8181)    │     (metadata)
+                          └─────────┬──────────┘
+                                    │ S3 API
+                          ┌─────────▼──────────┐
+                          │      Garage        │
+                          │  S3-compatible     │
+                          │  object storage    │
+                          └────────────────────┘
+                          (swap to real S3 later)
+
+  ┌────────────────────┐    ┌────────────────────┐
+  │  DuckDB container  │    │  SedonaSpark       │
+  │  interactive SQL   │    │  (--profile heavy) │
+  │  + spatial + ice   │    │  ETL, batch jobs   │
+  └────────────────────┘    └────────────────────┘
+
+  ┌────────────────────────────────────────────────┐
+  │              Webmap (deck.gl v9)               │
+  │  DuckDB-WASM + MapLibre v5 + OpenFreeMap      │
+  │  namespace selector, layer toggles, zoom-to   │
+  └────────────────────────────────────────────────┘
 ```
+
+### Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| **nginx** (webmap) | 3000 | Reverse proxy, webmap UI, URL rewriting |
+| **FastAPI + DuckDB** | 3000/api/ | Feature queries, upload, namespace management |
+| **pygeoapi** | 3000/ogc/ | OGC API Features (auto-discovers Iceberg tables) |
+| **Esri GeoServices** | 3000/esri/ | ArcGIS-compatible FeatureServer (PBF + JSON) |
+| **LakeKeeper** | 8181 | Iceberg REST Catalog + UI |
+| **Garage** | 3900 | S3-compatible object storage |
+| **PostgreSQL** | 5432 | LakeKeeper catalog metadata |
+| **DuckDB** | - | Interactive SQL (exec into container) |
+| **SedonaSpark** | 8888 | JupyterLab (optional, `--profile heavy`) |
+
+## Prerequisites
+
+- Docker Desktop (with 8GB+ RAM allocated; 16GB+ if using Sedona)
+- Git
+- `curl` (for bootstrap)
 
 ## Quick Start
 
 ```bash
-# 1. Start the core stack (Garage + LakeKeeper + Postgres + DuckDB)
+# Clone
+git clone https://github.com/aoneil42/Iceberg-Geospatial-API-Server.git
+cd Iceberg-Geospatial-API-Server
+
+# Start the core stack
 docker compose up -d
 
-# 2. One-time bootstrap (creates secrets, bucket, warehouse)
+# One-time bootstrap (generates secrets, creates S3 bucket + Iceberg warehouse)
+chmod +x bootstrap.sh
 ./bootstrap.sh
 
-# 3. Open DuckDB with spatial + Iceberg ready
-docker compose exec duckdb duckdb -init /config/init.sql
+# Open the webmap
+open http://localhost:3000
 ```
 
-## Usage
+The bootstrap script:
+1. Generates cryptographic secrets for Garage (RPC, admin, metrics tokens)
+2. Assigns Garage cluster layout (single-node, 10GB)
+3. Creates the `lakehouse` S3 bucket and access key
+4. Patches all config files with the generated credentials
+5. Writes `.env` with `GARAGE_KEY_ID`, `GARAGE_SECRET_KEY`, `GARAGE_ADMIN_TOKEN`
+6. Bootstraps LakeKeeper (accepts ToS, creates the `lakehouse` warehouse)
 
-### DuckDB — Interactive spatial queries (daily driver)
+## Setting Up `.env`
+
+The `.env` file is **auto-generated by `bootstrap.sh`** and excluded from git. It contains:
+
+```bash
+# Generated by bootstrap.sh
+GARAGE_KEY_ID=GKxxxxxxxxxxxxxxxxxxxxxxxx      # Garage S3 access key ID
+GARAGE_SECRET_KEY=xxxxxxxxxxxxxxxxxxxxxxxx...  # Garage S3 secret (64-char hex)
+GARAGE_ADMIN_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxx... # Garage admin API token (64-char hex)
+
+# pygeoapi URL rewriting (nginx handles this automatically)
+# "auto" works for local, LAN, and EC2 deployments
+PYGEOAPI_SERVER_URL=auto
+```
+
+**If you need to recreate `.env` manually** (e.g., cloning onto a new machine with existing Garage data):
+
+```bash
+# Get your Garage key ID and secret from the admin API
+curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:3903/v1/key | jq
+
+# Create .env
+cat > .env << 'EOF'
+GARAGE_KEY_ID=<your-key-id>
+GARAGE_SECRET_KEY=<your-secret-key>
+GARAGE_ADMIN_TOKEN=<your-admin-token>
+PYGEOAPI_SERVER_URL=auto
+EOF
+```
+
+**For EC2 deployment**: No changes needed. `PYGEOAPI_SERVER_URL=auto` combined with nginx's `sub_filter` dynamically rewrites all OGC API links to match the request hostname.
+
+## Uploading Data
+
+### Web UI
+
+Navigate to **http://localhost:3000/api/upload** for a drag-and-drop upload form. Accepts GeoJSON and GeoParquet files.
+
+### API
+
+```bash
+# Upload a GeoJSON file to namespace "mydata", table "cities"
+curl -X POST "http://localhost:3000/api/upload?namespace=mydata&table_name=cities" \
+  -F "files=@cities.geojson"
+
+# Append to existing table
+curl -X POST "http://localhost:3000/api/upload?namespace=mydata&table_name=cities&append=true" \
+  -F "files=@more_cities.geojson"
+```
+
+### SedonaSpark (batch)
+
+```bash
+docker compose --profile heavy up sedona -d
+# Open JupyterLab at http://localhost:8888
+```
+
+```python
+from sedona.spark import SedonaContext
+sedona = SedonaContext.builder().getOrCreate()
+
+sedona.sql("CREATE NAMESPACE IF NOT EXISTS lakehouse.mydata")
+sedona.sql("""
+  CREATE TABLE lakehouse.mydata.buildings (
+    id STRING, name STRING, geometry BINARY
+  ) USING iceberg
+""")
+```
+
+## API Endpoints
+
+### Feature API (FastAPI + DuckDB)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/namespaces` | List Iceberg namespaces |
+| GET | `/api/tables/{namespace}` | List tables in a namespace |
+| GET | `/api/features/{namespace}/{layer}` | Query features (GeoJSON) |
+| GET | `/api/bbox/{namespace}` | Bounding box for a namespace |
+| GET | `/api/bbox/{namespace}/{table}` | Bounding box for a table |
+| GET | `/api/upload` | Upload form (HTML) |
+| POST | `/api/upload` | Upload GeoJSON/GeoParquet files |
+| GET | `/api/docs` | Swagger UI |
+| GET | `/api/health` | Health check |
+
+### OGC API Features (pygeoapi)
+
+| Path | Description |
+|------|-------------|
+| `/ogc/` | Landing page |
+| `/ogc/collections` | List all collections (auto-discovered from catalog) |
+| `/ogc/collections/{id}/items` | Query features |
+| `/ogc/conformance` | Supported conformance classes |
+| `/ogc/openapi` | OpenAPI spec |
+
+Collections are **auto-discovered** from LakeKeeper every 30 seconds. Adding or removing Iceberg tables automatically updates the OGC API without restarts.
+
+### Esri GeoServices REST
+
+| Path | Description |
+|------|-------------|
+| `/esri/rest/services` | Service catalog |
+| `/esri/rest/services/{namespace}/FeatureServer` | FeatureServer metadata |
+| `/esri/rest/services/{namespace}/FeatureServer/{id}` | Layer metadata |
+| `/esri/rest/services/{namespace}/FeatureServer/{id}/query` | Feature query (PBF/JSON) |
+
+Compatible with ArcGIS Pro, ArcGIS Online, and any Esri REST client. Supports PBF (Protocol Buffers) for high-performance feature transfer.
+
+## DuckDB Interactive Queries
 
 ```bash
 docker compose exec duckdb duckdb -init /config/init.sql
 ```
 
 ```sql
--- Verify spatial extension
-SELECT ST_Point(-104.99, 39.74) AS denver;
-
--- List Iceberg tables
+-- List all Iceberg tables
 SHOW ALL TABLES;
 
--- Read GeoParquet directly from Garage
-SELECT * FROM 's3://lakehouse/my-data.geoparquet' LIMIT 10;
-
--- Query Iceberg tables through LakeKeeper
-SELECT * FROM lakehouse.my_namespace.my_table;
-```
-
-### SedonaSpark — Heavy spatial ETL (on demand)
-
-```bash
-# Start Sedona (adds ~8GB RAM)
-docker compose --profile heavy up sedona -d
-
-# Open Jupyter at http://localhost:8888
-```
-
-```python
-# In a Jupyter notebook
-from sedona.spark import SedonaContext
-
-sedona = SedonaContext.builder().getOrCreate()
-
-# Create an Iceberg table with geometry
-sedona.sql("""
-  CREATE NAMESPACE IF NOT EXISTS lakehouse.spatial
-""")
-sedona.sql("""
-  CREATE TABLE lakehouse.spatial.buildings (
-    id STRING,
-    name STRING,
-    geometry BINARY
-  ) USING iceberg
-  TBLPROPERTIES('format-version'='3')
-""")
-```
-
-### Stopping
-
-```bash
-docker compose down                        # core stack
-docker compose --profile heavy down        # if Sedona was running
-docker compose down -v                     # nuke all data + start fresh
+-- Spatial query
+SELECT id, name, ST_AsText(ST_GeomFromWKB(geometry))
+FROM lakehouse.colorado.points
+WHERE ST_Within(
+  ST_GeomFromWKB(geometry),
+  ST_GeomFromText('POLYGON((-105.5 39.5, -104.5 39.5, -104.5 40.5, -105.5 40.5, -105.5 39.5))')
+);
 ```
 
 ## File Structure
 
 ```
-spatial-lakehouse/
-├── docker-compose.yml        # Service definitions
-├── bootstrap.sh              # One-time init (run after first `up`)
-├── garage.toml               # Garage S3 config
-├── create-warehouse.json     # LakeKeeper warehouse definition
-├── duckdb-init.sql           # DuckDB startup: extensions + catalog
-├── sedona-defaults.conf      # Spark config for SedonaSpark
-├── notebooks/                # Shared notebook directory
-├── .env                      # Auto-generated credentials (after bootstrap)
-└── README.md
+lakehouse/
+├── docker-compose.yml           # All service definitions
+├── bootstrap.sh                 # One-time setup (secrets, bucket, warehouse)
+├── .env                         # Auto-generated credentials (git-ignored)
+├── garage.toml                  # Garage S3 config
+├── create-warehouse.json        # LakeKeeper warehouse definition
+├── duckdb-init.sql              # DuckDB startup: extensions + catalog
+├── sedona-defaults.conf         # Spark/Sedona config (Iceberg + S3)
+├── api/                         # FastAPI + DuckDB feature service
+│   ├── Dockerfile
+│   ├── main.py                  # Routes, upload, namespace management
+│   └── requirements.txt
+├── iceberg-geo-api/             # Esri GeoServices + OGC API
+│   ├── Dockerfile.geoservices
+│   ├── Dockerfile.pygeoapi
+│   ├── docker/
+│   │   └── pygeoapi-entrypoint.sh   # Catalog watcher + auto-discovery
+│   ├── config/
+│   │   ├── catalog.yml              # PyIceberg catalog config
+│   │   └── pygeoapi-config.yml      # OGC API base config
+│   ├── src/iceberg_geo/
+│   │   ├── query/                   # Shared query engine (DuckDB + Iceberg)
+│   │   ├── geoservices/             # Esri FeatureServer (PBF + JSON)
+│   │   └── pygeoapi_provider/       # OGC API provider plugin
+│   └── tests/
+├── webmap/                      # deck.gl + MapLibre frontend
+│   ├── Dockerfile
+│   ├── nginx.conf               # Reverse proxy + URL rewriting
+│   ├── src/
+│   │   ├── main.ts              # App entry, dataset loading
+│   │   ├── map.ts               # MapLibre + deck.gl setup
+│   │   ├── layers.ts            # deck.gl layer definitions
+│   │   ├── queries.ts           # DuckDB-WASM queries
+│   │   └── ui.ts                # Namespace tree, layer toggles
+│   └── public/data/             # Static Parquet files (git-ignored)
+└── notebooks/                   # Jupyter notebooks
+    ├── colorado_sample_data.ipynb
+    └── query_cookbook.ipynb
 ```
 
-## Endpoints
+## Accessing from Other Machines (LAN / ArcPro)
 
-| Service            | URL                          | Notes                          |
-|--------------------|------------------------------|--------------------------------|
-| Garage S3 API      | http://localhost:3900        | S3-compatible endpoint         |
-| Garage Admin API   | http://localhost:3903        | Cluster management             |
-| LakeKeeper UI      | http://localhost:8181        | Warehouse + table browser      |
-| LakeKeeper Catalog | http://localhost:8181/catalog | Iceberg REST API               |
-| Jupyter (Sedona)   | http://localhost:8888        | heavy profile only             |
-| Spark Master UI    | http://localhost:8080        | heavy profile only             |
+All services are accessible via the host machine's LAN IP on port 3000:
 
-## M1 Mac Notes
+```
+http://<lan-ip>:3000/          # Webmap
+http://<lan-ip>:3000/api/docs  # Swagger UI
+http://<lan-ip>:3000/ogc/      # OGC API (for ArcPro, QGIS)
+http://<lan-ip>:3000/esri/     # Esri GeoServices (for ArcPro)
+http://<lan-ip>:3000/api/upload # Upload form
+```
 
-- All images publish `arm64` variants
-- Core stack (no Sedona): ~2GB RAM
-- With Sedona: +8GB RAM (configurable via `DRIVER_MEM` / `EXECUTOR_MEM`)
-- DuckDB spatial queries run in milliseconds — ideal for AI query loops
-- SedonaSpark is intentionally behind a `--profile heavy` gate to save resources
+**ArcPro connections:**
+- **OGC API Features**: Add OGC API server → `http://<lan-ip>:3000/ogc/`
+- **Esri FeatureServer**: Add ArcGIS Server → `http://<lan-ip>:3000/esri/rest/services`
+
+nginx dynamically rewrites URLs in OGC API responses to match the requesting hostname, so the same deployment works from localhost, LAN, and EC2 without config changes.
 
 ## Migration to Production S3
 
-When ready to point at real S3:
+When ready to point at real AWS S3:
 
-1. Update `create-warehouse.json` with your real S3 bucket, region, and credentials
-2. Update the warehouse in LakeKeeper UI (or recreate via API)
-3. Update `duckdb-init.sql` S3 secret with real AWS credentials
+1. Update `create-warehouse.json` with your S3 bucket, region, and IAM credentials
+2. Recreate the warehouse in LakeKeeper (UI or API)
+3. Update `duckdb-init.sql` S3 secrets
 4. Update `sedona-defaults.conf` S3 endpoint + keys
-5. Garage can be removed from the compose file
+5. Update `.env` with AWS credentials
+6. Remove the `garage` service from `docker-compose.yml`
 
 Your Iceberg tables, schemas, and SQL all stay the same.
 
+## Resource Usage
+
+| Profile | RAM | Services |
+|---------|-----|----------|
+| Core (default) | ~4GB | Garage, LakeKeeper, Postgres, DuckDB, API, pygeoapi, geoservices, webmap |
+| Heavy (`--profile heavy`) | +8-10GB | Adds SedonaSpark + JupyterLab |
+
+Memory limits are set per-service in `docker-compose.yml` and can be tuned.
+
 ## Known Limitations
 
-- **DuckDB ↔ LakeKeeper ↔ Garage**: DuckDB's Iceberg extension supports S3-backed
-  REST catalogs. If you hit credential issues, check that LakeKeeper's warehouse
-  storage profile has `path-style-access: true` and Garage's key has read/write.
-- **Iceberg v3 native geometry types**: Neither DuckDB nor SedonaSpark fully supports
-  Iceberg v3 native `GEOMETRY` columns end-to-end yet (SEDONA-744). Geometry is
-  stored as WKB in binary columns. This is the industry state-of-the-art as of
-  early 2026.
-- **DuckDB Iceberg writes**: Write support is new (v1.3+). Stick to SedonaSpark
-  for production table creation and heavy writes.
-- **Iceberg table maintenance**: Compaction, snapshot expiry, and orphan file
-  cleanup must be run via SedonaSpark or PyIceberg — neither DuckDB nor LakeKeeper
-  handles this automatically.
+- **Iceberg v3 native geometry**: Neither DuckDB nor SedonaSpark fully supports Iceberg v3 `GEOMETRY` columns end-to-end yet. Geometry is stored as WKB in binary columns (industry standard as of early 2026).
+- **DuckDB Iceberg writes**: Write support is new (v1.3+). Use SedonaSpark or PyIceberg for heavy writes and table creation.
+- **Table maintenance**: Compaction, snapshot expiry, and orphan file cleanup require SedonaSpark or PyIceberg.
+- **Single-node Garage**: Replication factor is 1 (dev mode). Not for production data durability.
