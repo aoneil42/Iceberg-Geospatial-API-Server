@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# OS
+.DS_Store
+
+# Node
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Build artifacts
+webmap/dist/
+
+# Claude
+.claude/
+
+# Data files (too large for git)
+webmap/public/data/*.parquet
+notebooks/*.ipynb_checkpoints/

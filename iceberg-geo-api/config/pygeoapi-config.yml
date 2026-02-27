@@ -1,0 +1,156 @@
+server:
+    bind:
+        host: 0.0.0.0
+        port: 5000
+    url: ${PYGEOAPI_SERVER_URL}
+    mimetype: application/json; charset=UTF-8
+    encoding: utf-8
+    gzip: true
+    languages:
+        - en-US
+    cors: true
+    limits:
+        default_items: 100
+        max_items: 10000
+    map:
+        url: https://tile.openstreetmap.org/{z}/{x}/{y}.png
+        attribution: '&copy; <a href="https://openstreetmap.org/copyright">OpenStreetMap</a>'
+
+logging:
+    level: INFO
+
+metadata:
+    identification:
+        title: Lakehouse OGC API
+        description: OGC API Features backed by the spatial Iceberg lakehouse
+        keywords:
+            - iceberg
+            - geospatial
+            - ogc api
+            - colorado
+        keywords_type: theme
+        terms_of_service: null
+        url: https://github.com/aoneil42
+    license:
+        name: Apache-2.0
+        url: https://www.apache.org/licenses/LICENSE-2.0
+    provider:
+        name: Lakehouse
+        url: http://localhost:3000
+    contact:
+        name: Admin
+
+resources:
+    colorado-points:
+        type: collection
+        title: Colorado Points
+        description: 5,000 point features across Colorado (parks, schools, hospitals, etc.)
+        keywords:
+            - points
+            - colorado
+        extents:
+            spatial:
+                bbox: [-109.05, 37.0, -102.05, 41.0]
+                crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+        providers:
+            - type: feature
+              name: iceberg_geo.pygeoapi_provider.iceberg.IcebergProvider
+              data: colorado.points
+              id_field: id
+              options:
+                  geometry_column: geometry
+
+    colorado-lines:
+        type: collection
+        title: Colorado Lines
+        description: 3,000 line features across Colorado (roads, trails, streams)
+        keywords:
+            - lines
+            - colorado
+        extents:
+            spatial:
+                bbox: [-109.05, 37.0, -102.05, 41.0]
+                crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+        providers:
+            - type: feature
+              name: iceberg_geo.pygeoapi_provider.iceberg.IcebergProvider
+              data: colorado.lines
+              id_field: id
+              options:
+                  geometry_column: geometry
+
+    colorado-polygons:
+        type: collection
+        title: Colorado Polygons
+        description: 2,000 polygon features across Colorado (parcels by land use)
+        keywords:
+            - polygons
+            - colorado
+        extents:
+            spatial:
+                bbox: [-109.05, 37.0, -102.05, 41.0]
+                crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+        providers:
+            - type: feature
+              name: iceberg_geo.pygeoapi_provider.iceberg.IcebergProvider
+              data: colorado.polygons
+              id_field: id
+              options:
+                  geometry_column: geometry
+
+    usa-points:
+        type: collection
+        title: USA Points
+        description: Point features across the continental United States
+        keywords:
+            - points
+            - usa
+        extents:
+            spatial:
+                bbox: [-125.0, 24.0, -66.0, 50.0]
+                crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+        providers:
+            - type: feature
+              name: iceberg_geo.pygeoapi_provider.iceberg.IcebergProvider
+              data: usa.points
+              id_field: id
+              options:
+                  geometry_column: geometry
+
+    usa-lines:
+        type: collection
+        title: USA Lines
+        description: Line features across the continental United States
+        keywords:
+            - lines
+            - usa
+        extents:
+            spatial:
+                bbox: [-125.0, 24.0, -66.0, 50.0]
+                crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+        providers:
+            - type: feature
+              name: iceberg_geo.pygeoapi_provider.iceberg.IcebergProvider
+              data: usa.lines
+              id_field: id
+              options:
+                  geometry_column: geometry
+
+    usa-polygons:
+        type: collection
+        title: USA Polygons
+        description: Polygon features across the continental United States
+        keywords:
+            - polygons
+            - usa
+        extents:
+            spatial:
+                bbox: [-125.0, 24.0, -66.0, 50.0]
+                crs: http://www.opengis.net/def/crs/OGC/1.3/CRS84
+        providers:
+            - type: feature
+              name: iceberg_geo.pygeoapi_provider.iceberg.IcebergProvider
+              data: usa.polygons
+              id_field: id
+              options:
+                  geometry_column: geometry

@@ -1,0 +1,243 @@
+########################################################################
+#  Spatial Lakehouse — Docker Compose
+#  Garage · LakeKeeper · PostgreSQL · DuckDB+Spatial · SedonaSpark
+#
+#  Target: Apple Silicon (M1/M2/M3) local dev via Claude Code
+#
+#  Quick start:
+#    docker compose up -d            # core stack (no Sedona)
+#    ./bootstrap.sh                  # one-time Garage + LakeKeeper init
+#    docker compose exec duckdb duckdb -init /config/init.sql
+#
+#  To add SedonaSpark when needed:
+#    docker compose --profile heavy up sedona -d
+#
+#  Endpoints:
+#    Garage S3 API ........... http://localhost:3900
+#    LakeKeeper UI ........... http://localhost:8181
+#    LakeKeeper Catalog API .. http://localhost:8181/catalog
+#    Webmap .................. http://localhost:3000
+#    OGC API Features ........ http://localhost:5050    (or /ogc/ via nginx)
+#    Esri GeoServices REST ... http://localhost:8001    (or /esri/ via nginx)
+#    SedonaSpark Jupyter ..... http://localhost:8888    (heavy profile)
+#    Spark Master UI ......... http://localhost:8080    (heavy profile)
+########################################################################
+
+services:
+
+  # ─── Object Storage ──────────────────────────────────────────────
+  garage:
+    image: dxflrs/garage:v2.2.0
+    container_name: garage
+    ports:
+      - "3900:3900"   # S3 API
+      - "3901:3901"   # RPC
+      - "3903:3903"   # Admin API
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    mem_limit: 512m
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # ─── Catalog DB ──────────────────────────────────────────────────
+  postgres:
+    image: postgres:17
+    container_name: lakehouse-postgres
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper -d lakekeeper"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    mem_limit: 512m
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # ─── Iceberg REST Catalog — DB migration ─────────────────────────
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest
+    container_name: lakekeeper-migrate
+    environment: &lk-env
+      LAKEKEEPER__PG_ENCRYPTION_KEY: "${LAKEKEEPER_PG_ENCRYPTION_KEY:-this-is-not-secure-change-for-prod}"
+      LAKEKEEPER__PG_DATABASE_URL_READ: "postgresql://lakekeeper:lakekeeper@postgres:5432/lakekeeper"
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: "postgresql://lakekeeper:lakekeeper@postgres:5432/lakekeeper"
+      LAKEKEEPER__AUTHZ_BACKEND: "allowall"
+      RUST_LOG: "info,iceberg_catalog=debug"
+    command: ["migrate"]
+    mem_limit: 512m
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # ─── Iceberg REST Catalog — server ───────────────────────────────
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest
+    container_name: lakekeeper
+    ports:
+      - "8181:8181"
+    environment:
+      <<: *lk-env
+    command: ["serve"]
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      timeout: 10s
+      retries: 15
+      start_period: 5s
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    mem_limit: 1g
+    restart: unless-stopped
+    networks:
+      - lakehouse
+
+  # ─── Interactive Compute: DuckDB + Spatial ───────────────────────
+  #   Usage: docker compose exec duckdb duckdb -init /config/init.sql
+  duckdb:
+    image: datacatering/duckdb:v1.3.0
+    container_name: duckdb
+    entrypoint: ["tail", "-f", "/dev/null"]
+    volumes:
+      - ./duckdb-init.sql:/config/init.sql:ro
+      - ./notebooks:/notebooks
+      - duckdb-data:/data
+    mem_limit: 2g
+    restart: unless-stopped
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # ─── Feature API: FastAPI + DuckDB ────────────────────────────────
+  #   Live spatial queries against Iceberg tables via DuckDB.
+  #   Endpoint: http://localhost:8000/api/features/{layer}
+  api:
+    build: ./api
+    container_name: lakehouse-api
+    ports:
+      - "8000:8000"
+    environment:
+      GARAGE_KEY_ID: "${GARAGE_KEY_ID}"
+      GARAGE_SECRET_KEY: "${GARAGE_SECRET_KEY}"
+    mem_limit: 2g
+    restart: unless-stopped
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # ─── OGC API Features: pygeoapi + PyIceberg ──────────────────────
+  #   Standards-compliant OGC API serving Iceberg geospatial data.
+  #   Endpoint: http://localhost:5050 (direct) or /ogc/ via nginx
+  pygeoapi:
+    build:
+      context: ./iceberg-geo-api
+      dockerfile: Dockerfile.pygeoapi
+    container_name: pygeoapi
+    ports:
+      - "5050:5000"
+    environment:
+      GARAGE_KEY_ID: "${GARAGE_KEY_ID}"
+      GARAGE_SECRET_KEY: "${GARAGE_SECRET_KEY}"
+      PYGEOAPI_SERVER_URL: "${PYGEOAPI_SERVER_URL:-auto}"
+    mem_limit: 2g
+    restart: unless-stopped
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # ─── Esri GeoServices REST: FastAPI + PyIceberg ─────────────────
+  #   ArcGIS-compatible REST API for Iceberg geospatial data.
+  #   Endpoint: http://localhost:8001 (direct) or /esri/ via nginx
+  geoservices:
+    build:
+      context: ./iceberg-geo-api
+      dockerfile: Dockerfile.geoservices
+    container_name: geoservices
+    ports:
+      - "8001:8001"
+    environment:
+      GARAGE_KEY_ID: "${GARAGE_KEY_ID}"
+      GARAGE_SECRET_KEY: "${GARAGE_SECRET_KEY}"
+      ROOT_PATH: "/esri"
+    mem_limit: 6g
+    restart: unless-stopped
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # ─── Webmap: DuckDB-WASM + deck.gl + MapLibre ────────────────────
+  #   Cloud-native geospatial visualization.
+  #   Dev mode: cd webmap && npm run dev  (port 5173, with proxy)
+  #   Docker:   docker compose up webmap  (port 3000, nginx + proxy)
+  webmap:
+    build: ./webmap
+    container_name: webmap
+    ports:
+      - "3000:80"
+    mem_limit: 256m
+    restart: unless-stopped
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  # ─── Heavy Compute: SedonaSpark ──────────────────────────────────
+  #   Activated with:  docker compose --profile heavy up sedona -d
+  #   M1 note: Sedona image is multi-arch. 4g+4g = 8GB total.
+  #   Adjust DRIVER_MEM / EXECUTOR_MEM if your Mac has 16GB+ RAM.
+  sedona:
+    image: apache/sedona:latest
+    container_name: sedona
+    profiles: ["heavy"]
+    ports:
+      - "8888:8888"   # JupyterLab
+      - "8080:8080"   # Spark Master UI
+      - "8085:8085"   # Zeppelin
+      - "4040:4040"   # Spark App UI
+    environment:
+      DRIVER_MEM: "${SEDONA_DRIVER_MEM:-4g}"
+      EXECUTOR_MEM: "${SEDONA_EXECUTOR_MEM:-4g}"
+    volumes:
+      - sedona-opt:/opt
+      - ./notebooks:/notebooks
+      - ./sedona-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    mem_limit: "${SEDONA_MEM_LIMIT:-10g}"
+    restart: unless-stopped
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+volumes:
+  garage-meta:
+  garage-data:
+  pg-data:
+  duckdb-data:
+  sedona-opt:
+
+networks:
+  lakehouse:
+    driver: bridge

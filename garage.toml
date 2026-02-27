@@ -1,0 +1,25 @@
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+
+# Single-node dev setup: no redundancy. Data is lost if the volume is deleted.
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "garage:3901"
+rpc_secret = "83b8d33476955fc4c80ecae1925329339294aba620964c26b35b5351d30d974d"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"
+root_domain = ".s3.garage.localhost"
+
+[s3_web]
+bind_addr = "[::]:3902"
+root_domain = ".web.garage.localhost"
+index = "index.html"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "cdbf71b482fc90a0099f947102b689859dbc218a86661994bb8e83acd9215f20"
+metrics_token = "06db9ddd1a8f905645e8e3a7b162e2e2ca3df0e35bc14e418036ec0b5b1dbfae"

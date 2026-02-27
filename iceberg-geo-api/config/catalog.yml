@@ -1,0 +1,16 @@
+# PyIceberg catalog configuration for the lakehouse stack.
+# Connects to LakeKeeper (Iceberg REST catalog) + Garage (S3 storage).
+# S3 credentials use ${ENV_VAR} syntax, resolved at runtime by catalog.py.
+
+catalog:
+    name: lakehouse
+    type: rest
+    uri: http://lakekeeper:8181/catalog
+    warehouse: lakehouse
+    token: dummy
+    s3.endpoint: http://garage:3900
+    s3.access-key-id: ${GARAGE_KEY_ID}
+    s3.secret-access-key: ${GARAGE_SECRET_KEY}
+    s3.region: garage
+    s3.path-style-access: "true"
+    s3.remote-signing-enabled: "false"

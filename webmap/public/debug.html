@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html>
+<head><title>GeoArrow Debug</title>
+<style>
+  body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #0f0; }
+  pre { white-space: pre-wrap; margin: 4px 0; }
+  .err { color: #f44; }
+  .ok { color: #4f4; }
+  .warn { color: #ff4; }
+  #map { width: 100%; height: 400px; margin-top: 20px; }
+</style>
+</head>
+<body>
+<h2>GeoArrow Pipeline Debug</h2>
+<div id="log"></div>
+<div id="map"></div>
+
+<script type="module">
+import initWasm, { readGeoParquet } from '/assets/geoparquet-wasm.js';
+import { tableFromIPC } from '/assets/apache-arrow.js';
+
+// We'll import from the actual built bundle chunks - but that's complex.
+// Instead let's use dynamic imports from CDN that match our versions.
+
+const log = document.getElementById('log');
+function info(msg) { log.innerHTML += `<pre>${msg}</pre>`; }
+function ok(msg) { log.innerHTML += `<pre class="ok">✓ ${msg}</pre>`; }
+function err(msg) { log.innerHTML += `<pre class="err">✗ ${msg}</pre>`; }
+function warn(msg) { log.innerHTML += `<pre class="warn">⚠ ${msg}</pre>`; }
+
+info('Loading modules...');
+</script>
+
+<!-- Use inline ES module that imports from our actual node_modules via Vite dev server -->
+<!-- This page won't work in production (nginx). Use with: npm run dev -->
+<script type="module">
+// This script runs the full pipeline test
+const log = document.getElementById('log');
+function info(msg) { log.innerHTML += `<pre>${msg}</pre>`; }
+function ok(msg) { log.innerHTML += `<pre class="ok">✓ ${msg}</pre>`; }
+function err(msg) { log.innerHTML += `<pre class="err">✗ ${msg}</pre>`; }
+function warn(msg) { log.innerHTML += `<pre class="warn">⚠ ${msg}</pre>`; }
+
+try {
+  // Step 1: Load WASM
+  info('Step 1: Loading geoparquet-wasm...');
+  const wasmMod = await import('@geoarrow/geoparquet-wasm/esm/index.js');
+  await wasmMod.default();
+  ok('WASM loaded');
+
+  // Step 2: Fetch a small sample
+  info('Step 2: Fetching ukraine/buildings (limit=100)...');
+  const resp = await fetch('/api/features/ukraine/buildings?limit=100&bbox=26,50,27,51');
+  if (!resp.ok) { err(`HTTP ${resp.status}`); throw new Error('fetch failed'); }
+  const buf = new Uint8Array(await resp.arrayBuffer());
+  ok(`Fetched ${buf.length} bytes`);
+
+  // Step 3: Convert with readGeoParquet
+  info('Step 3: readGeoParquet...');
+  const wasmTable = wasmMod.readGeoParquet(buf);
+  ok('readGeoParquet succeeded');
+
+  // Step 4: Convert to IPC stream
+  info('Step 4: intoIPCStream...');
+  const ipcBytes = wasmTable.intoIPCStream();
+  ok(`IPC stream: ${ipcBytes.length} bytes`);
+
+  // Step 5: tableFromIPC
+  info('Step 5: tableFromIPC...');
+  const { tableFromIPC } = await import('apache-arrow');
+  const table = tableFromIPC(ipcBytes);
+  ok(`Arrow Table: ${table.numRows} rows, ${table.numCols} cols, ${table.batches.length} batches`);
+
+  // Step 6: Inspect schema
+  info('Step 6: Schema inspection...');
+  for (const f of table.schema.fields) {
+    const meta = {};
+    for (const [k, v] of f.metadata) meta[k] = v;
+    const metaStr = Object.keys(meta).length > 0 ? JSON.stringify(meta) : '(no metadata)';
+    info(`  ${f.name}: ${f.type} | ${metaStr}`);
+  }
+
+  // Step 7: Check geometry column extension name
+  const geomField = table.schema.fields.find(f => f.name === 'geometry');
+  if (geomField) {
+    const extName = geomField.metadata.get('ARROW:extension:name');
+    if (extName) {
+      ok(`Geometry extension name: "${extName}"`);
+      if (extName === 'geoarrow.polygon') {
+        ok('Extension name matches EXTENSION_NAME.POLYGON');
+      } else {
+        warn(`Extension name "${extName}" does NOT match "geoarrow.polygon"`);
+      }
+    } else {
+      err('No ARROW:extension:name metadata on geometry column!');
+      info('Available metadata keys: ' + JSON.stringify([...geomField.metadata.keys()]));
+    }
+  } else {
+    err('No geometry column found!');
+  }
+
+  // Step 8: Check geometry column type structure
+  const geomCol = table.getChild('geometry');
+  if (geomCol) {
+    info('Step 8: Geometry column structure...');
+    let t = geomCol.type;
+    let depth = 0;
+    while (t) {
+      info('  '.repeat(depth + 1) + `type: ${t.toString()} (typeId: ${t.typeId})`);
+      if (t.children && t.children.length > 0) {
+        t = t.children[0].type;
+        depth++;
+      } else if (t.valueType) {
+        t = t.valueType;
+        depth++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  // Step 9: Try to create the GeoArrow layer
+  info('Step 9: Creating GeoArrowSolidPolygonLayer...');
+  const { GeoArrowSolidPolygonLayer } = await import('@geoarrow/deck.gl-layers');
+
+  try {
+    const layer = new GeoArrowSolidPolygonLayer({
+      id: 'test-polygon',
+      data: table,
+      getFillColor: [30, 144, 255, 160],
+      pickable: true,
+    });
+    ok(`Layer created: ${layer.id}`);
+    info(`  Layer props.data numRows: ${layer.props.data.numRows}`);
+  } catch (e) {
+    err(`Layer creation failed: ${e.message}`);
+    info(e.stack);
+  }
+
+  // Step 10: Try getGeometryVector manually
+  info('Step 10: Manual geometry vector lookup...');
+  const geoarrowJs = await import('@geoarrow/geoarrow-js');
+  info('  geoarrow-js loaded');
+
+  // Check if geometry column is recognized as polygon
+  if (geomCol) {
+    for (const d of geomCol.data) {
+      info(`  RecordBatch data type: ${d.type?.toString()}`);
+      try {
+        const isPoly = geoarrowJs.vector?.isPolygonVector?.(geomCol);
+        info(`  isPolygonVector: ${isPoly}`);
+      } catch(e) {
+        warn(`  isPolygonVector check failed: ${e.message}`);
+      }
+      try {
+        const isMultiPoly = geoarrowJs.vector?.isMultiPolygonVector?.(geomCol);
+        info(`  isMultiPolygonVector: ${isMultiPoly}`);
+      } catch(e) {
+        warn(`  isMultiPolygonVector check failed: ${e.message}`);
+      }
+    }
+  }
+
+  ok('Debug complete! Check results above for any issues.');
+
+} catch (e) {
+  err(`Fatal error: ${e.message}`);
+  info(e.stack);
+}
+</script>
+</body>
+</html>

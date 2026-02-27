@@ -1,0 +1,25 @@
+{
+  "name": "lakehouse-webmap",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@deck.gl/core": "^9.1.0",
+    "@deck.gl/layers": "^9.1.0",
+    "@deck.gl/mapbox": "^9.1.0",
+    "@geoarrow/deck.gl-layers": "^0.3.1",
+    "@geoarrow/geoparquet-wasm": "0.2.0-beta.5",
+    "apache-arrow": ">=15",
+    "maplibre-gl": "^5.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vite": "^6.1.0",
+    "vite-plugin-wasm": "^3.5.0"
+  }
+}

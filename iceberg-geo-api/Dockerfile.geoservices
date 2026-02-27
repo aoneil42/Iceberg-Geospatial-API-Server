@@ -1,0 +1,31 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgeos-dev \
+    libproj-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY pyproject.toml .
+COPY src/ src/
+
+RUN pip install --no-cache-dir ".[geoservices]" && \
+    pip install --no-cache-dir s3fs
+
+# Pre-install DuckDB spatial extension so it's available at runtime
+# without needing network access
+RUN python -c "import duckdb; conn = duckdb.connect(); conn.install_extension('spatial'); conn.load_extension('spatial'); print('DuckDB spatial extension installed')"
+
+# Generate protobuf Python classes if not already committed
+RUN protoc --python_out=src/iceberg_geo/geoservices/proto/ \
+    --proto_path=src/iceberg_geo/geoservices/proto/ \
+    src/iceberg_geo/geoservices/proto/FeatureCollection.proto || true
+
+COPY config/ config/
+
+EXPOSE 8001
+
+CMD ["uvicorn", "iceberg_geo.geoservices.app:app", \
+     "--host", "0.0.0.0", "--port", "8001", "--workers", "2"]
