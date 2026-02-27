@@ -47,6 +47,19 @@ A containerized geospatial data lakehouse with three API interfaces (Esri GeoSer
   └────────────────────────────────────────────────┘
 ```
 
+### Webmap Rendering Pipeline
+
+The webmap uses a **zero-copy GeoArrow pipeline** — no GeoJSON conversion in the rendering path:
+
+1. **Fetch**: The API serves features as GeoParquet. `@geoarrow/geoparquet-wasm` decodes them in-browser into **Apache Arrow tables** via WebAssembly.
+2. **Detect**: Geometry type (Point, LineString, Polygon) is auto-detected from GeoArrow extension metadata on the Arrow table's geometry column.
+3. **Render**: `@geoarrow/deck.gl-layers` renders directly from Arrow columnar memory to the GPU:
+   - `GeoArrowScatterplotLayer` — points
+   - `GeoArrowPathLayer` — lines
+   - `GeoArrowSolidPolygonLayer` — polygons
+
+Data stays in Arrow columnar format from network fetch through to GPU upload, avoiding the serialization overhead of GeoJSON.
+
 ### Services
 
 | Service | Port | Description |
