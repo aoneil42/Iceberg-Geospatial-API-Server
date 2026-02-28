@@ -6,7 +6,7 @@ A containerized geospatial data lakehouse with three API interfaces (Esri GeoSer
 
 ```
                          ┌──────────────────────────────────────┐
-                         │          nginx (port 3000)           │
+                         │           nginx (port 80)            │
                          │    reverse proxy + URL rewriting     │
                          └──┬───────┬───────┬───────┬──────────┘
                             │       │       │       │
@@ -64,10 +64,10 @@ Data stays in Arrow columnar format from network fetch through to GPU upload, av
 
 | Service | Port | Description |
 |---------|------|-------------|
-| **nginx** (webmap) | 3000 | Reverse proxy, webmap UI, URL rewriting |
-| **FastAPI + DuckDB** | 3000/api/ | Feature queries, upload, namespace management |
-| **pygeoapi** | 3000/ogc/ | OGC API Features (auto-discovers Iceberg tables) |
-| **Esri GeoServices** | 3000/esri/ | ArcGIS-compatible FeatureServer (PBF + JSON) |
+| **nginx** (webmap) | 80 | Reverse proxy, webmap UI, URL rewriting |
+| **FastAPI + DuckDB** | /api/ | Feature queries, upload, namespace management |
+| **pygeoapi** | /ogc/ | OGC API Features (auto-discovers Iceberg tables) |
+| **Esri GeoServices** | /esri/ | ArcGIS-compatible FeatureServer (PBF + JSON) |
 | **LakeKeeper** | 8181 | Iceberg REST Catalog + UI |
 | **Garage** | 3900 | S3-compatible object storage |
 | **PostgreSQL** | 5432 | LakeKeeper catalog metadata |
@@ -96,7 +96,7 @@ chmod +x bootstrap.sh
 ./bootstrap.sh
 
 # Open the webmap
-open http://localhost:3000
+open http://localhost
 ```
 
 The bootstrap script:
@@ -143,17 +143,17 @@ EOF
 
 ### Web UI
 
-Navigate to **http://localhost:3000/api/upload** for a drag-and-drop upload form. Accepts GeoJSON and GeoParquet files.
+Navigate to **http://localhost/api/upload** for a drag-and-drop upload form. Accepts GeoJSON and GeoParquet files.
 
 ### API
 
 ```bash
 # Upload a GeoJSON file to namespace "mydata", table "cities"
-curl -X POST "http://localhost:3000/api/upload?namespace=mydata&table_name=cities" \
+curl -X POST "http://localhost/api/upload?namespace=mydata&table_name=cities" \
   -F "files=@cities.geojson"
 
 # Append to existing table
-curl -X POST "http://localhost:3000/api/upload?namespace=mydata&table_name=cities&append=true" \
+curl -X POST "http://localhost/api/upload?namespace=mydata&table_name=cities&append=true" \
   -F "files=@more_cities.geojson"
 ```
 
@@ -350,19 +350,19 @@ lakehouse/
 
 ## Accessing from Other Machines (LAN / ArcPro)
 
-All services are accessible via the host machine's LAN IP on port 3000:
+All services are accessible via the host machine's LAN IP on port 80:
 
 ```
-http://<lan-ip>:3000/          # Webmap
-http://<lan-ip>:3000/api/docs  # Swagger UI
-http://<lan-ip>:3000/ogc/      # OGC API (for ArcPro, QGIS)
-http://<lan-ip>:3000/esri/     # Esri GeoServices (for ArcPro)
-http://<lan-ip>:3000/api/upload # Upload form
+http://<lan-ip>/          # Webmap
+http://<lan-ip>/api/docs  # Swagger UI
+http://<lan-ip>/ogc/      # OGC API (for ArcPro, QGIS)
+http://<lan-ip>/esri/     # Esri GeoServices (for ArcPro)
+http://<lan-ip>/api/upload # Upload form
 ```
 
 **ArcPro connections:**
-- **OGC API Features**: Add OGC API server → `http://<lan-ip>:3000/ogc/`
-- **Esri FeatureServer**: Add ArcGIS Server → `http://<lan-ip>:3000/esri/rest/services`
+- **OGC API Features**: Add OGC API server → `http://<lan-ip>/ogc/`
+- **Esri FeatureServer**: Add ArcGIS Server → `http://<lan-ip>/esri/rest/services`
 
 nginx dynamically rewrites URLs in OGC API responses to match the requesting hostname, so the same deployment works from localhost, LAN, and EC2 without config changes.
 

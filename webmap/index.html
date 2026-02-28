@@ -3,15 +3,80 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Lakehouse Webmap</title>
+    <title>Spatial Lakehouse</title>
   </head>
   <body>
-    <div id="map"></div>
-    <div id="controls"></div>
-    <div id="status"></div>
-    <div id="popup" class="popup hidden"></div>
-    <div id="identify-panel" class="identify-panel hidden"></div>
-    <div id="select-box"></div>
+    <div id="sidebar">
+      <div class="sidebar-header">
+        <h1 class="sidebar-title">Spatial Lakehouse</h1>
+        <p class="sidebar-subtitle">Geospatial Data Platform</p>
+      </div>
+      <nav class="sidebar-nav">
+        <div class="sidebar-section">
+          <h2 class="sidebar-section-title">API Services</h2>
+          <a href="/api/docs" class="sidebar-link" target="_blank">
+            <span class="sidebar-link-icon">{}</span>
+            <div>
+              <div class="sidebar-link-title">Feature API</div>
+              <div class="sidebar-link-desc">Swagger UI &mdash; DuckDB queries</div>
+            </div>
+          </a>
+          <a href="/ogc/" class="sidebar-link" target="_blank">
+            <span class="sidebar-link-icon">OGC</span>
+            <div>
+              <div class="sidebar-link-title">OGC API Features</div>
+              <div class="sidebar-link-desc">Standards-based access</div>
+            </div>
+          </a>
+          <a href="/esri/rest/services" class="sidebar-link" target="_blank">
+            <span class="sidebar-link-icon">Esri</span>
+            <div>
+              <div class="sidebar-link-title">Esri GeoServices</div>
+              <div class="sidebar-link-desc">ArcGIS-compatible REST</div>
+            </div>
+          </a>
+        </div>
+        <div class="sidebar-section">
+          <h2 class="sidebar-section-title">Tools</h2>
+          <a href="/api/upload" class="sidebar-link" target="_blank">
+            <span class="sidebar-link-icon">&#x2B06;</span>
+            <div>
+              <div class="sidebar-link-title">Data Upload</div>
+              <div class="sidebar-link-desc">GeoJSON &amp; GeoParquet</div>
+            </div>
+          </a>
+          <a href="http://localhost:8181" class="sidebar-link" target="_blank">
+            <span class="sidebar-link-icon">&#x2744;</span>
+            <div>
+              <div class="sidebar-link-title">LakeKeeper</div>
+              <div class="sidebar-link-desc">Iceberg catalog UI</div>
+            </div>
+          </a>
+        </div>
+        <div class="sidebar-section">
+          <h2 class="sidebar-section-title">AI Integration</h2>
+          <a href="http://localhost:8082/mcp" class="sidebar-link" target="_blank">
+            <span class="sidebar-link-icon">&#x1F916;</span>
+            <div>
+              <div class="sidebar-link-title">MCP Server</div>
+              <div class="sidebar-link-desc">localhost:8082/mcp</div>
+            </div>
+          </a>
+        </div>
+      </nav>
+      <div class="sidebar-footer">
+        Apache Iceberg &middot; DuckDB &middot; deck.gl
+      </div>
+    </div>
+    <button id="sidebar-toggle" class="sidebar-toggle" title="Collapse sidebar">&#x276E;</button>
+    <div id="map-container">
+      <div id="map"></div>
+      <div id="controls"></div>
+      <div id="status"></div>
+      <div id="popup" class="popup hidden"></div>
+      <div id="identify-panel" class="identify-panel hidden"></div>
+      <div id="select-box"></div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

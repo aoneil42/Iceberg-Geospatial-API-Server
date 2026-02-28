@@ -36,7 +36,7 @@ metadata:
         url: https://www.apache.org/licenses/LICENSE-2.0
     provider:
         name: Lakehouse
-        url: http://localhost:3000
+        url: http://localhost
     contact:
         name: Admin
 

@@ -286,6 +286,20 @@ async function main() {
   initLayerTree(nsTables, handleLayerToggle, handleZoom, handleRefresh, handleLimitChange);
   setStatus("No layers visible");
 
+  // --- Sidebar toggle ---
+  const sidebar = document.getElementById("sidebar");
+  const sidebarToggle = document.getElementById("sidebar-toggle");
+  if (sidebar && sidebarToggle) {
+    sidebarToggle.addEventListener("click", () => {
+      const collapsed = sidebar.classList.toggle("collapsed");
+      sidebarToggle.classList.toggle("collapsed", collapsed);
+      sidebarToggle.innerHTML = collapsed ? "&#x276F;" : "&#x276E;";
+      sidebarToggle.title = collapsed ? "Expand sidebar" : "Collapse sidebar";
+      // Let the CSS transition finish, then tell MapLibre the container changed
+      setTimeout(() => map.resize(), 260);
+    });
+  }
+
   // --- Mouse tracking for popups ---
   map.getCanvas().addEventListener("mousemove", (e) => {
     lastMouseX = e.clientX;

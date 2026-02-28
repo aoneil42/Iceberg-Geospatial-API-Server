@@ -16,7 +16,7 @@
 #    Garage S3 API ........... http://localhost:3900
 #    LakeKeeper UI ........... http://localhost:8181
 #    LakeKeeper Catalog API .. http://localhost:8181/catalog
-#    Webmap .................. http://localhost:3000
+#    Webmap .................. http://localhost
 #    OGC API Features ........ http://localhost:5050    (or /ogc/ via nginx)
 #    Esri GeoServices REST ... http://localhost:8001    (or /esri/ via nginx)
 #    MCP Server (AI agents) .. http://localhost:8082/mcp
@@ -222,12 +222,12 @@ services:
   # ─── Webmap: DuckDB-WASM + deck.gl + MapLibre ────────────────────
   #   Cloud-native geospatial visualization.
   #   Dev mode: cd webmap && npm run dev  (port 5173, with proxy)
-  #   Docker:   docker compose up webmap  (port 3000, nginx + proxy)
+  #   Docker:   docker compose up webmap  (port 80, nginx + proxy)
   webmap:
     build: ./webmap
     container_name: webmap
     ports:
-      - "3000:80"
+      - "80:80"
     mem_limit: 256m
     restart: unless-stopped
     depends_on:

@@ -3,7 +3,7 @@ set -e
 
 # PYGEOAPI_SERVER_URL controls link generation in OGC API responses.
 #
-# Default: http://localhost:3000/ogc — the nginx proxy rewrites this
+# Default: http://localhost/ogc — the nginx proxy rewrites this
 # in all JSON/HTML responses to match the actual request host, so links
 # work from any client (localhost, LAN IP, EC2 public IP) automatically.
 #
@@ -11,8 +11,12 @@ set -e
 #   PYGEOAPI_SERVER_URL=http://my-server:5050
 #
 if [ -z "$PYGEOAPI_SERVER_URL" ] || [ "$PYGEOAPI_SERVER_URL" = "auto" ]; then
-    PORT="${PUBLIC_PORT:-3000}"
-    export PYGEOAPI_SERVER_URL="http://localhost:${PORT}/ogc"
+    PORT="${PUBLIC_PORT:-80}"
+    if [ "$PORT" = "80" ]; then
+        export PYGEOAPI_SERVER_URL="http://localhost/ogc"
+    else
+        export PYGEOAPI_SERVER_URL="http://localhost:${PORT}/ogc"
+    fi
 fi
 echo "[pygeoapi] PYGEOAPI_SERVER_URL=${PYGEOAPI_SERVER_URL}"
 
