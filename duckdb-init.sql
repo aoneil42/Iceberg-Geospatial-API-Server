@@ -1,5 +1,5 @@
 -- DuckDB initialization: spatial lakehouse connection
--- Run with:  duckdb -init /config/init.sql
+-- Run with:  /duckdb -init /config/init.sql
 
 INSTALL httpfs;
 LOAD httpfs;

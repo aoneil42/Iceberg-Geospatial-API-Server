@@ -1,6 +1,6 @@
 # Spatial Lakehouse
 
-A containerized geospatial data lakehouse with three API interfaces (Esri GeoServices, OGC API Features, GeoParquet), a deck.gl webmap, and Apache Iceberg table storage. Built for local development on Apple Silicon with a clear path to AWS deployment.
+A containerized geospatial data lakehouse with three API interfaces (Esri GeoServices, OGC API Features, GeoParquet), a deck.gl webmap, and Apache Iceberg table storage. Built for local development (Apple Silicon and x86-64) with a clear path to AWS deployment.
 
 ## Architecture
 
@@ -72,6 +72,7 @@ Data stays in Arrow columnar format from network fetch through to GPU upload, av
 | **Garage** | 3900 | S3-compatible object storage |
 | **PostgreSQL** | 5432 | LakeKeeper catalog metadata |
 | **DuckDB** | - | Interactive SQL (exec into container) |
+| **MCP Server** | 8082 | AI agent access via Model Context Protocol |
 | **SedonaSpark** | 8888 | JupyterLab (optional, `--profile heavy`) |
 
 ## Prerequisites
@@ -217,7 +218,7 @@ Compatible with ArcGIS Pro, ArcGIS Online, and any Esri REST client. Supports PB
 ## DuckDB Interactive Queries
 
 ```bash
-docker compose exec duckdb duckdb -init /config/init.sql
+docker compose exec duckdb /duckdb -init /config/init.sql
 ```
 
 ```sql
@@ -233,6 +234,73 @@ WHERE ST_Within(
 );
 ```
 
+## MCP Server (AI Agent Access)
+
+The stack includes an MCP (Model Context Protocol) server that lets LLM agents
+query the lakehouse using natural language. The server runs DuckDB with spatial
+and Iceberg extensions, connected to the same catalog and storage as all other
+services.
+
+### Connecting from Claude Desktop
+
+Add to your Claude Desktop MCP config (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "spatial-lakehouse": {
+      "type": "streamable-http",
+      "url": "http://localhost:8082/mcp"
+    }
+  }
+}
+```
+
+### Connecting from Cursor
+
+Go to Settings > MCP > Add new global MCP server, then add:
+
+```json
+{
+  "mcpServers": {
+    "spatial-lakehouse": {
+      "type": "streamable-http",
+      "url": "http://localhost:8082/mcp"
+    }
+  }
+}
+```
+
+### Connecting from Claude Code
+
+```bash
+claude mcp add spatial-lakehouse --transport http --url http://localhost:8082/mcp
+```
+
+### Example Queries (via AI agent)
+
+Once connected, you can ask your AI assistant things like:
+
+- "What namespaces are in the lakehouse?"
+- "Show me the schema of the buildings table in the colorado namespace"
+- "Find all features within 1km of downtown Denver"
+- "How many points are in each namespace?"
+- "Run a spatial join between buildings and parcels"
+
+The agent translates these to DuckDB spatial SQL and executes them against
+your Iceberg tables.
+
+### Direct MCP Testing
+
+```bash
+# Test the MCP server is running
+curl http://localhost:8082/mcp
+
+# Use the MCP inspector for interactive testing
+npx @modelcontextprotocol/inspector
+# Then connect to http://localhost:8082/mcp
+```
+
 ## File Structure
 
 ```
@@ -244,6 +312,10 @@ lakehouse/
 ├── create-warehouse.json        # LakeKeeper warehouse definition
 ├── duckdb-init.sql              # DuckDB startup: extensions + catalog
 ├── sedona-defaults.conf         # Spark/Sedona config (Iceberg + S3)
+├── mcp/                         # MCP server (AI agent access)
+│   ├── Dockerfile
+│   ├── duckdb-mcp-init.sql      # DuckDB init: extensions + catalog
+│   └── entrypoint.sh            # Env templating + LakeKeeper wait
 ├── api/                         # FastAPI + DuckDB feature service
 │   ├── Dockerfile
 │   ├── main.py                  # Routes, upload, namespace management
@@ -311,7 +383,7 @@ Your Iceberg tables, schemas, and SQL all stay the same.
 
 | Profile | RAM | Services |
 |---------|-----|----------|
-| Core (default) | ~4GB | Garage, LakeKeeper, Postgres, DuckDB, API, pygeoapi, geoservices, webmap |
+| Core (default) | ~4GB | Garage, LakeKeeper, Postgres, DuckDB, MCP, API, pygeoapi, geoservices, webmap |
 | Heavy (`--profile heavy`) | +8-10GB | Adds SedonaSpark + JupyterLab |
 
 Memory limits are set per-service in `docker-compose.yml` and can be tuned.

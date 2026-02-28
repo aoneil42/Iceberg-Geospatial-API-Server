@@ -2,12 +2,12 @@
 #  Spatial Lakehouse — Docker Compose
 #  Garage · LakeKeeper · PostgreSQL · DuckDB+Spatial · SedonaSpark
 #
-#  Target: Apple Silicon (M1/M2/M3) local dev via Claude Code
+#  Target: local dev (Apple Silicon + x86-64) via Claude Code
 #
 #  Quick start:
 #    docker compose up -d            # core stack (no Sedona)
 #    ./bootstrap.sh                  # one-time Garage + LakeKeeper init
-#    docker compose exec duckdb duckdb -init /config/init.sql
+#    docker compose exec duckdb /duckdb -init /config/init.sql
 #
 #  To add SedonaSpark when needed:
 #    docker compose --profile heavy up sedona -d
@@ -19,6 +19,7 @@
 #    Webmap .................. http://localhost:3000
 #    OGC API Features ........ http://localhost:5050    (or /ogc/ via nginx)
 #    Esri GeoServices REST ... http://localhost:8001    (or /esri/ via nginx)
+#    MCP Server (AI agents) .. http://localhost:8082/mcp
 #    SedonaSpark Jupyter ..... http://localhost:8888    (heavy profile)
 #    Spark Master UI ......... http://localhost:8080    (heavy profile)
 ########################################################################
@@ -65,7 +66,7 @@ services:
 
   # ─── Iceberg REST Catalog — DB migration ─────────────────────────
   lakekeeper-migrate:
-    image: quay.io/lakekeeper/catalog:latest
+    image: quay.io/lakekeeper/catalog:v0.11.2
     container_name: lakekeeper-migrate
     environment: &lk-env
       LAKEKEEPER__PG_ENCRYPTION_KEY: "${LAKEKEEPER_PG_ENCRYPTION_KEY:-this-is-not-secure-change-for-prod}"
@@ -84,7 +85,7 @@ services:
 
   # ─── Iceberg REST Catalog — server ───────────────────────────────
   lakekeeper:
-    image: quay.io/lakekeeper/catalog:latest
+    image: quay.io/lakekeeper/catalog:v0.11.2
     container_name: lakekeeper
     ports:
       - "8181:8181"
@@ -106,9 +107,9 @@ services:
       - lakehouse
 
   # ─── Interactive Compute: DuckDB + Spatial ───────────────────────
-  #   Usage: docker compose exec duckdb duckdb -init /config/init.sql
+  #   Usage: docker compose exec duckdb /duckdb -init /config/init.sql
   duckdb:
-    image: datacatering/duckdb:v1.3.0
+    image: datacatering/duckdb:v1.4.4
     container_name: duckdb
     entrypoint: ["tail", "-f", "/dev/null"]
     volumes:
@@ -122,6 +123,38 @@ services:
         condition: service_healthy
     networks:
       - lakehouse
+
+  # ─── MCP Server (DuckDB + Spatial + Iceberg) ─────────────────────
+  #   Exposes the lakehouse to LLM agents via Model Context Protocol.
+  #   Connect from Claude Desktop, Cursor, or any MCP client.
+  #   Endpoint: http://localhost:8082/mcp (Streamable HTTP transport)
+  mcp-server:
+    build:
+      context: ./mcp
+      dockerfile: Dockerfile
+    container_name: mcp-server
+    ports:
+      - "8082:8082"
+    environment:
+      GARAGE_KEY_ID: "${GARAGE_KEY_ID}"
+      GARAGE_SECRET_KEY: "${GARAGE_SECRET_KEY}"
+      MCP_DB_PATH: ":memory:"
+      MCP_TRANSPORT: "http"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8082"
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - lakehouse
+    mem_limit: 2g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://localhost:8082/mcp"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   # ─── Feature API: FastAPI + DuckDB ────────────────────────────────
   #   Live spatial queries against Iceberg tables via DuckDB.
@@ -208,7 +241,7 @@ services:
   #   M1 note: Sedona image is multi-arch. 4g+4g = 8GB total.
   #   Adjust DRIVER_MEM / EXECUTOR_MEM if your Mac has 16GB+ RAM.
   sedona:
-    image: apache/sedona:latest
+    image: apache/sedona:1.8.1
     container_name: sedona
     profiles: ["heavy"]
     ports:
