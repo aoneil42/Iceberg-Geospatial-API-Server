@@ -1,9 +1,13 @@
 import "./style.css";
 import {
+  loadBasemapConfig,
   initMap,
   setLayers,
   getMap,
   getOverlay,
+  getBasemaps,
+  getCurrentBasemapIndex,
+  switchBasemap,
   pickObjectsInRect,
   flyToBounds,
   getViewportBbox,
@@ -12,6 +16,7 @@ import {
 import {
   loadLayer,
   fetchNamespaces,
+  fetchNamespaceTree,
   fetchTables,
   fetchTableBbox,
   expandBbox,
@@ -20,12 +25,13 @@ import {
   MAX_FEATURES_POLYGON,
 } from "./queries";
 import type { Bbox } from "./queries";
-import { buildAutoLayer, detectGeomType } from "./layers";
+import { buildAutoLayer, buildAggregateLayer, detectGeomType } from "./layers";
 import type { FeatureClickHandler, GeomType } from "./layers";
 import type { GeoArrowPickingInfo } from "@geoarrow/deck.gl-layers";
 import type { Table, Vector } from "apache-arrow";
 import {
-  initLayerTree,
+  initCatalogBrowser,
+  buildCatalogTree,
   updateTreeLayerCount,
   setTreeLayerLoading,
   setTreeLayerChecked,
@@ -33,6 +39,7 @@ import {
   showPopup,
   hidePopup,
   initIdentifyToggle,
+  initBasemapPicker,
   showIdentifyPanel,
   hideIdentifyPanel,
   addIdentifyResult,
@@ -40,7 +47,6 @@ import {
   deactivateIdentifyButton,
   debugLog,
 } from "./ui";
-import type { NsTableMap } from "./ui";
 
 // ---------------------------------------------------------------------------
 // State
@@ -52,8 +58,6 @@ const tables = new Map<string, Table>();
 const geomTypes = new Map<string, GeomType>();
 /** Set of currently visible layer keys ("namespace/layer") */
 const visibleSet = new Set<string>();
-/** Per-namespace table name lists (from the catalog) */
-let nsTables: NsTableMap = {};
 /** Viewport bbox used for the most recent load, per layer key */
 const loadedBbox = new Map<string, Bbox | undefined>();
 /** Keys currently being loaded — prevents moveend from re-triggering loads. */
@@ -63,9 +67,22 @@ const loadingKeys = new Set<string>();
  *  during earcut, deck.gl receives a new table reference → restarts earcut
  *  from scratch → the layer never finishes rendering. */
 const earcutCooldownKeys = new Set<string>();
+/** Zoom level at which each layer was last loaded */
+const loadedZoom = new Map<string, number>();
+/** Layer keys currently displayed in aggregate (grid-binned) mode */
+const aggregatedKeys = new Set<string>();
 
-/** User-configurable feature limit override; null = use defaults, 0 = unlimited */
-let userLimit: number | null = null;
+/** Below this zoom level, request server-side grid aggregation */
+const AGGREGATE_ZOOM_THRESHOLD = 11;
+
+/** Map zoom level to grid cell size in degrees */
+function getAggregateResolution(zoom: number): number {
+  if (zoom <= 3) return 5.0;
+  if (zoom <= 5) return 2.0;
+  if (zoom <= 7) return 0.5;
+  if (zoom <= 9) return 0.1;
+  return 0.05; // zoom 10
+}
 
 let identifyActive = false;
 let lastMouseX = 0;
@@ -98,9 +115,15 @@ function rebuildLayers() {
   for (const key of visibleKeys) {
     try {
       const t = tables.get(key)!;
-      debugLog(`  building ${key}: ${t.numRows} rows, ${t.batches.length} batches`);
-      const l = buildAutoLayer(t, true, handleClick, key);
-      debugLog(`  → ${key}: ${l.constructor.name} created OK`);
+      let l;
+      if (aggregatedKeys.has(key)) {
+        l = buildAggregateLayer(t, true, handleClick, key);
+        debugLog(`  → ${key}: aggregate bubble layer (${t.numRows} cells)`);
+      } else {
+        debugLog(`  building ${key}: ${t.numRows} rows, ${t.batches.length} batches`);
+        l = buildAutoLayer(t, true, handleClick, key);
+        debugLog(`  → ${key}: ${l.constructor.name} created OK`);
+      }
       layers.push(l);
     } catch (e) {
       debugLog(`  → ${key}: FAILED: ${(e as Error).message}`, "err");
@@ -141,8 +164,10 @@ function updateStatusBar() {
     if (!table) continue;
     const n = table.numRows;
     total += n;
+    const isAgg = aggregatedKeys.has(key);
     const gt = geomTypes.get(key) ?? "unknown";
-    parts.push(`${key}: ${n.toLocaleString()} ${GEOM_ABBREV[gt]}`);
+    const suffix = isAgg ? "clusters" : GEOM_ABBREV[gt];
+    parts.push(`${key}: ${n.toLocaleString()} ${suffix}`);
   }
 
   if (total === 0) {
@@ -175,11 +200,8 @@ const handleClick: FeatureClickHandler = (info) => {
 
 /** Return the appropriate feature limit for a given geometry type and zoom.
  *  Polygon limits scale with zoom: simplified polygons at low zoom are cheap,
- *  so we allow more; full-resolution polygons at high zoom stay conservative.
- *  Respects the user-configurable override if set. */
+ *  so we allow more; full-resolution polygons at high zoom stay conservative. */
 function getEffectiveLimit(gt?: GeomType, zoom?: number): number {
-  // userLimit === null → use defaults; userLimit === 0 → unlimited (very high)
-  if (userLimit !== null) return userLimit === 0 ? 10_000_000 : userLimit;
   switch (gt) {
     case "polygon": {
       const z = zoom ?? 12;
@@ -211,7 +233,9 @@ function getEarcutCooldown(numRows: number): number {
   return 20_000;
 }
 
-/** Load (or reload) a layer using the current viewport bbox. */
+/** Load (or reload) a layer using the current viewport bbox.
+ *  At low zoom levels, requests server-side grid aggregation instead of
+ *  individual features to avoid WASM OOM on massive datasets. */
 async function loadLayerWithViewport(
   ns: string,
   layer: string
@@ -227,57 +251,84 @@ async function loadLayerWithViewport(
   const fetchBbox = expandBbox(viewportBbox, 1.5);
   const knownType = geomTypes.get(key);
   const zoom = getMap().getZoom();
-  const limit = getEffectiveLimit(knownType, zoom);
-  const simplify = knownType === "polygon" ? getSimplifyTolerance(zoom) : undefined;
+  const useAggregate = zoom < AGGREGATE_ZOOM_THRESHOLD;
 
   setTreeLayerLoading(ns, layer, true);
   try {
-    const table = await loadLayer(ns, layer, fetchBbox, limit, simplify);
-    const gt = detectGeomType(table);
-    tables.set(key, table);
-    geomTypes.set(key, gt);
-    // Store the expanded bbox so bboxContains() has padding for small pans
-    loadedBbox.set(key, fetchBbox);
-    updateTreeLayerCount(ns, layer, table.numRows);
+    if (useAggregate) {
+      // --- Aggregated mode: server returns grid-binned centroids + counts ---
+      const resolution = getAggregateResolution(zoom);
+      const table = await loadLayer(
+        ns, layer, fetchBbox, 50_000, undefined,
+        { resolution }
+      );
+      tables.set(key, table);
+      // Preserve original geom type if known; aggregated data is always points
+      if (!knownType) geomTypes.set(key, "point");
+      aggregatedKeys.add(key);
+      loadedBbox.set(key, fetchBbox);
+      loadedZoom.set(key, zoom);
+      updateTreeLayerCount(ns, layer, table.numRows);
+      debugLog(
+        `loaded ${key} AGGREGATED: ${table.numRows} cells, resolution=${resolution}`
+      );
+    } else {
+      // --- Full-resolution mode ---
+      aggregatedKeys.delete(key);
+      const limit = getEffectiveLimit(knownType, zoom);
+      const simplify = knownType === "polygon" ? getSimplifyTolerance(zoom) : undefined;
 
-    // Debug: log schema info for troubleshooting rendering issues
-    debugLog(`loaded ${key}: ${table.numRows} rows, geomType=${gt}, batches=${table.batches.length}`);
-    for (const f of table.schema.fields) {
-      const ext = f.metadata.get("ARROW:extension:name") ?? "";
-      debugLog(`  field: ${f.name}  type=${f.type}  ext=${ext}`);
-    }
+      const table = await loadLayer(ns, layer, fetchBbox, limit, simplify);
+      const gt = detectGeomType(table);
+      tables.set(key, table);
+      geomTypes.set(key, gt);
+      loadedBbox.set(key, fetchBbox);
+      loadedZoom.set(key, zoom);
+      updateTreeLayerCount(ns, layer, table.numRows);
 
-    // Deep geometry diagnostics — log raw coordinate values + offsets
-    if (gt === "polygon") {
-      debugLogGeometry(table, key);
-    }
-
-    // If this was the first load and the type is point or line, we used a
-    // conservative initial limit.  Re-fetch with the proper higher limit.
-    if (!knownType && (gt === "point" || gt === "line")) {
-      const higherLimit = getEffectiveLimit(gt, zoom);
-      if (table.numRows >= limit && higherLimit > limit) {
-        debugLog(`re-fetching ${key} with ${gt} limit (${higherLimit})`);
-        const bigger = await loadLayer(ns, layer, fetchBbox, higherLimit);
-        tables.set(key, bigger);
-        geomTypes.set(key, gt);
-        updateTreeLayerCount(ns, layer, bigger.numRows);
+      debugLog(`loaded ${key}: ${table.numRows} rows, geomType=${gt}, batches=${table.batches.length}`);
+      for (const f of table.schema.fields) {
+        const ext = f.metadata.get("ARROW:extension:name") ?? "";
+        debugLog(`  field: ${f.name}  type=${f.type}  ext=${ext}`);
       }
-    }
 
-    // For polygon layers, set a dynamic cooldown that scales with feature count
-    if (gt === "polygon") {
-      const cooldown = getEarcutCooldown(table.numRows);
-      earcutCooldownKeys.add(key);
-      setTimeout(() => {
-        earcutCooldownKeys.delete(key);
-        debugLog(`earcut cooldown expired for ${key} (${cooldown}ms)`);
-      }, cooldown);
+      if (gt === "polygon") {
+        debugLogGeometry(table, key);
+      }
+
+      // If this was the first load and the type is point or line, we used a
+      // conservative initial limit.  Re-fetch with the proper higher limit.
+      if (!knownType && (gt === "point" || gt === "line")) {
+        const higherLimit = getEffectiveLimit(gt, zoom);
+        if (table.numRows >= limit && higherLimit > limit) {
+          debugLog(`re-fetching ${key} with ${gt} limit (${higherLimit})`);
+          const bigger = await loadLayer(ns, layer, fetchBbox, higherLimit);
+          tables.set(key, bigger);
+          geomTypes.set(key, gt);
+          updateTreeLayerCount(ns, layer, bigger.numRows);
+        }
+      }
+
+      // For polygon layers, set a dynamic cooldown that scales with feature count
+      if (gt === "polygon") {
+        const cooldown = getEarcutCooldown(table.numRows);
+        earcutCooldownKeys.add(key);
+        setTimeout(() => {
+          earcutCooldownKeys.delete(key);
+          debugLog(`earcut cooldown expired for ${key} (${cooldown}ms)`);
+        }, cooldown);
+      }
     }
   } catch (e) {
     console.error(`Failed to load ${key}:`, e);
-    visibleSet.delete(key);
-    setTreeLayerChecked(ns, layer, false);
+    debugLog(`LOAD ERROR ${key}: ${(e as Error).message}`, "err");
+    // If we already had cached data, keep the layer visible with stale data.
+    // Only uncheck the layer if this was the first load (no cached data).
+    if (!tables.has(key)) {
+      visibleSet.delete(key);
+      setTreeLayerChecked(ns, layer, false);
+    }
+    setStatus(`Failed to load ${key}: ${(e as Error).message}`);
   }
   setTreeLayerLoading(ns, layer, false);
   loadingKeys.delete(key);
@@ -289,15 +340,26 @@ async function loadLayerWithViewport(
 
 async function main() {
   setStatus("Initializing...");
-  const map = initMap();
 
-  // Discover available namespaces from the catalog
-  const namespaces = await fetchNamespaces().catch(() => ["colorado"]);
+  // Load basemap configuration before map init
+  const basemapConfigs = await loadBasemapConfig();
+  const map = initMap(basemapConfigs[0].style);
+
+  // Discover available namespaces from the catalog (tree endpoint preferred)
+  let namespacePaths: string[][];
+  try {
+    namespacePaths = await fetchNamespaceTree();
+  } catch {
+    // Fallback: flat namespace list wrapped as single-segment paths
+    const flatNs = await fetchNamespaces().catch(() => ["colorado"]);
+    namespacePaths = flatNs.map((ns) => [ns]);
+  }
 
   // Discover tables per namespace (in parallel)
   setStatus("Discovering tables...");
+  const dottedPaths = namespacePaths.map((p) => p.join("."));
   const tablesPerNs = await Promise.all(
-    namespaces.map(async (ns) => {
+    dottedPaths.map(async (ns) => {
       try {
         const tblNames = await fetchTables(ns);
         return [ns, tblNames] as const;
@@ -306,10 +368,11 @@ async function main() {
       }
     })
   );
-  nsTables = Object.fromEntries(tablesPerNs);
+  const tablesMap = Object.fromEntries(tablesPerNs);
 
-  // Build the layer tree UI — no layers enabled by default
-  initLayerTree(nsTables, handleLayerToggle, handleZoom, handleRefresh, handleLimitChange);
+  // Build recursive catalog tree and render in sidebar
+  const tree = buildCatalogTree(namespacePaths, tablesMap);
+  initCatalogBrowser(tree, handleLayerToggle, handleZoom, handleRefresh);
   setStatus("No layers visible");
 
   // --- Sidebar toggle ---
@@ -350,16 +413,28 @@ async function main() {
 
   async function reloadVisibleLayers() {
     const bbox = getViewportBbox();
+    const currentZoom = getMap().getZoom();
+    const shouldAggregate = currentZoom < AGGREGATE_ZOOM_THRESHOLD;
+
     const reloadKeys = [...visibleSet].filter((key) => {
-      // Skip layers currently being loaded — prevents moveend from
-      // restarting a load and causing earcut to restart from scratch.
       if (loadingKeys.has(key)) return false;
-      // Skip polygon layers in earcut cooldown — reloading would create a
-      // new table reference, making deck.gl restart earcut from scratch.
       if (earcutCooldownKeys.has(key)) return false;
+
+      // Always reload if we crossed the aggregate/full-res threshold
+      const wasAggregated = aggregatedKeys.has(key);
+      if (wasAggregated !== shouldAggregate) return true;
+
+      // In aggregate mode, reload if the resolution bucket changed
+      if (shouldAggregate) {
+        const prevZoom = loadedZoom.get(key);
+        if (prevZoom !== undefined) {
+          if (getAggregateResolution(prevZoom) !== getAggregateResolution(currentZoom))
+            return true;
+        }
+      }
+
       const prev = loadedBbox.get(key);
       if (!prev) return true;
-      // Reload if the new viewport extends significantly beyond the loaded bbox
       return !bboxContains(prev, bbox);
     });
     if (reloadKeys.length === 0) return;
@@ -394,6 +469,8 @@ async function main() {
       }
     } else {
       visibleSet.delete(key);
+      aggregatedKeys.delete(key);
+      loadedZoom.delete(key);
     }
 
     rebuildLayers();
@@ -401,16 +478,18 @@ async function main() {
   }
 
   // -----------------------------------------------------------------------
-  // Refresh + Limit handlers
+  // Refresh handler
   // -----------------------------------------------------------------------
 
   async function handleRefresh() {
     debugLog("Manual refresh triggered");
-    // Clear cached data and reload all visible layers
+    // Clear bbox + cooldown + aggregation caches but keep table data so a
+    // failed reload doesn't lose the layer.
     for (const key of [...visibleSet]) {
-      tables.delete(key);
       loadedBbox.delete(key);
+      loadedZoom.delete(key);
       earcutCooldownKeys.delete(key);
+      aggregatedKeys.delete(key);
     }
     setStatus("Refreshing...");
     await Promise.all(
@@ -421,13 +500,6 @@ async function main() {
     );
     rebuildLayers();
     updateStatusBar();
-  }
-
-  function handleLimitChange(limit: number) {
-    userLimit = limit === 0 ? 0 : limit; // 0 = unlimited
-    debugLog(`Feature limit changed to: ${limit === 0 ? "unlimited" : limit}`);
-    // Auto-refresh after limit change
-    handleRefresh();
   }
 
   // -----------------------------------------------------------------------
@@ -551,6 +623,11 @@ async function main() {
       dragStart = null;
       selectBox.style.display = "none";
     }
+  });
+
+  // Basemap picker (only shows when multiple basemaps configured)
+  initBasemapPicker(getBasemaps(), getCurrentBasemapIndex(), (index) => {
+    switchBasemap(index);
   });
 }
 

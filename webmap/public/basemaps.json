@@ -1,0 +1,10 @@
+[
+  {
+    "name": "Liberty",
+    "style": "https://tiles.openfreemap.org/styles/liberty"
+  },
+  {
+    "name": "Bright",
+    "style": "https://tiles.openfreemap.org/styles/bright"
+  }
+]

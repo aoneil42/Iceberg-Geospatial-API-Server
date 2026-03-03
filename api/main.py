@@ -11,8 +11,10 @@ import tempfile
 import threading
 import time
 
-import duckdb
+import urllib.parse
 import urllib.request
+
+import duckdb
 from fastapi import FastAPI, File, Form, Query, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 
@@ -24,6 +26,7 @@ _pool: DuckDBPool | None = None
 _catalog_prefix: str | None = None
 
 _VALID_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_VALID_NS_PATH = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
 
 # Schema cache: keyed by "namespace.layer.metadata_loc" → (timestamp, cols_info)
 _schema_cache: dict[str, tuple[float, list]] = {}
@@ -48,10 +51,21 @@ def _get_catalog_prefix() -> str:
     return _catalog_prefix
 
 
+def _encode_namespace(namespace: str) -> str:
+    """Encode a dotted namespace path for the Iceberg REST catalog API.
+
+    The Iceberg REST spec uses the Unit Separator character (0x1F) to join
+    multi-part namespace identifiers in URLs.  For example,
+    ``colorado.water`` becomes ``colorado%1Fwater``.
+    """
+    return urllib.parse.quote(namespace.replace(".", "\x1f"), safe="")
+
+
 def _get_metadata_location(namespace: str, layer: str) -> str:
     """Query LakeKeeper REST API for the latest metadata location of a table."""
     prefix = _get_catalog_prefix()
-    url = f"{CATALOG_URL}/v1/{prefix}/namespaces/{namespace}/tables/{layer}"
+    ns_encoded = _encode_namespace(namespace)
+    url = f"{CATALOG_URL}/v1/{prefix}/namespaces/{ns_encoded}/tables/{layer}"
     req = urllib.request.Request(url, headers={"Authorization": "Bearer dummy"})
     with urllib.request.urlopen(req) as resp:
         data = json.loads(resp.read())
@@ -61,11 +75,19 @@ def _get_metadata_location(namespace: str, layer: str) -> str:
 def _init_connection() -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect()
 
-    # Ensure DuckDB has a writable home directory for extension caching
-    conn.execute("SET home_directory = '/tmp'")
-    conn.execute("INSTALL httpfs; LOAD httpfs;")
-    conn.execute("INSTALL iceberg; LOAD iceberg;")
-    conn.execute("INSTALL spatial; LOAD spatial;")
+    # Air-gap support: load extensions from a mounted volume if configured,
+    # otherwise download from the DuckDB extension repository (default).
+    ext_dir = os.environ.get("DUCKDB_EXTENSION_DIR")
+    if ext_dir:
+        conn.execute(f"SET extension_directory = '{ext_dir}'")
+        conn.execute("SET autoinstall_known_extensions = false")
+        conn.execute("SET autoload_known_extensions = false")
+        for ext in ("httpfs", "iceberg", "spatial"):
+            conn.execute(f"LOAD {ext}")
+    else:
+        conn.execute("SET home_directory = '/tmp'")
+        for ext in ("httpfs", "iceberg", "spatial"):
+            conn.execute(f"INSTALL {ext}; LOAD {ext};")
 
     key_id = os.environ["GARAGE_KEY_ID"]
     secret = os.environ["GARAGE_SECRET_KEY"]
@@ -128,24 +150,45 @@ def startup() -> None:
 
 @app.get("/api/namespaces")
 def list_namespaces() -> list[str]:
-    """List available Iceberg namespaces."""
+    """List available Iceberg namespaces as dotted paths."""
     prefix = _get_catalog_prefix()
     url = f"{CATALOG_URL}/v1/{prefix}/namespaces"
     req = urllib.request.Request(url, headers={"Authorization": "Bearer dummy"})
     with urllib.request.urlopen(req) as resp:
         data = json.loads(resp.read())
-    return [ns[0] if isinstance(ns, list) else ns for ns in data["namespaces"]]
+    return [
+        ".".join(ns) if isinstance(ns, list) else ns
+        for ns in data["namespaces"]
+    ]
+
+
+@app.get("/api/namespaces/tree")
+def list_namespaces_tree() -> list[list[str]]:
+    """List all namespaces as path arrays (supports nested namespaces).
+
+    Returns e.g. ``[["colorado"], ["colorado", "water"]]``.
+    """
+    prefix = _get_catalog_prefix()
+    url = f"{CATALOG_URL}/v1/{prefix}/namespaces"
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer dummy"})
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read())
+    return [
+        ns if isinstance(ns, list) else [ns]
+        for ns in data["namespaces"]
+    ]
 
 
 @app.get("/api/tables/{namespace}")
 def list_tables(namespace: str) -> list[str]:
-    """List tables in a namespace."""
-    if not _VALID_NAME.match(namespace):
+    """List tables in a namespace (supports dotted paths like 'colorado.water')."""
+    if not _VALID_NS_PATH.match(namespace):
         return JSONResponse(
             status_code=400, content={"error": "Invalid namespace name"}
         )
     prefix = _get_catalog_prefix()
-    url = f"{CATALOG_URL}/v1/{prefix}/namespaces/{namespace}/tables"
+    ns_encoded = _encode_namespace(namespace)
+    url = f"{CATALOG_URL}/v1/{prefix}/namespaces/{ns_encoded}/tables"
     req = urllib.request.Request(url, headers={"Authorization": "Bearer dummy"})
     with urllib.request.urlopen(req) as resp:
         data = json.loads(resp.read())
@@ -182,7 +225,7 @@ def _compute_bbox(source: str) -> tuple[float, float, float, float] | None:
 @app.get("/api/bbox/{namespace}")
 def get_bbox(namespace: str) -> dict:
     """Get the aggregate bounding box for all geometry in a namespace."""
-    if not _VALID_NAME.match(namespace):
+    if not _VALID_NS_PATH.match(namespace):
         return JSONResponse(
             status_code=400, content={"error": "Invalid namespace name"}
         )
@@ -221,7 +264,7 @@ def get_bbox(namespace: str) -> dict:
 @app.get("/api/bbox/{namespace}/{table_name}")
 def get_table_bbox(namespace: str, table_name: str) -> dict:
     """Get the bounding box for a single table."""
-    if not _VALID_NAME.match(namespace):
+    if not _VALID_NS_PATH.match(namespace):
         return JSONResponse(
             status_code=400, content={"error": "Invalid namespace name"}
         )
@@ -269,8 +312,14 @@ def get_features(
     simplify: float | None = Query(
         default=None, ge=0, description="Simplification tolerance in degrees"
     ),
+    mode: str | None = Query(
+        default=None, description="Query mode: 'aggregate' for grid-binned centroids"
+    ),
+    resolution: float | None = Query(
+        default=None, gt=0, description="Grid cell size in degrees (for mode=aggregate)"
+    ),
 ) -> Response:
-    if not _VALID_NAME.match(namespace):
+    if not _VALID_NS_PATH.match(namespace):
         return JSONResponse(
             status_code=400, content={"error": "Invalid namespace name"}
         )
@@ -357,6 +406,41 @@ def get_features(
 
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     limit_clause = f" LIMIT {limit}" if limit else ""
+
+    # ---- Aggregation mode: grid-binned centroids with counts ----
+    if mode == "aggregate":
+        res = resolution or 0.1
+        centroid = f"ST_Centroid({geom_from})"
+        agg_sql = (
+            f"SELECT "
+            f"  ST_Point("
+            f"    (FLOOR(ST_X({centroid}) / {res}) + 0.5) * {res},"
+            f"    (FLOOR(ST_Y({centroid}) / {res}) + 0.5) * {res}"
+            f"  ) AS geometry,"
+            f"  COUNT(*) AS feature_count"
+            f" FROM {source}{where}"
+            f" GROUP BY"
+            f"  FLOOR(ST_X({centroid}) / {res}),"
+            f"  FLOOR(ST_Y({centroid}) / {res})"
+            f" ORDER BY feature_count DESC"
+            f"{limit_clause}"
+        )
+        fd, tmppath = tempfile.mkstemp(suffix=".parquet")
+        os.close(fd)
+        try:
+            with _pool.acquire() as conn:  # type: ignore[union-attr]
+                conn.execute(
+                    f"COPY ({agg_sql}) TO '{tmppath}' (FORMAT PARQUET)"
+                )
+            with open(tmppath, "rb") as f:
+                data = f.read()
+        finally:
+            os.unlink(tmppath)
+        return Response(
+            content=data,
+            media_type="application/x-parquet",
+            headers={"X-Aggregation-Mode": "true", "X-Resolution": str(res)},
+        )
 
     # Total count (before LIMIT) for truncation detection
     total_count: int | None = None
@@ -607,7 +691,7 @@ async def upload_dataset(
     Creates the namespace and table if they do not already exist.
     """
     # --- Validate names ---
-    if not _VALID_NAME.match(namespace):
+    if not _VALID_NS_PATH.match(namespace):
         return JSONResponse(
             status_code=400, content={"error": "Invalid namespace name"}
         )

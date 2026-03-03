@@ -39,7 +39,8 @@ export async function loadLayer(
   layer: string,
   bbox?: Bbox,
   maxFeatures: number = MAX_FEATURES_POINT,
-  simplify?: number
+  simplify?: number,
+  aggregate?: { resolution: number }
 ): Promise<Table> {
   const params = new URLSearchParams({ limit: String(maxFeatures) });
   if (bbox) {
@@ -47,6 +48,10 @@ export async function loadLayer(
   }
   if (simplify !== undefined && simplify > 0) {
     params.set("simplify", String(simplify));
+  }
+  if (aggregate) {
+    params.set("mode", "aggregate");
+    params.set("resolution", String(aggregate.resolution));
   }
   return loadGeoParquet(
     `${API_BASE}/features/${namespace}/${layer}?${params}`
@@ -56,6 +61,16 @@ export async function loadLayer(
 export async function fetchNamespaces(): Promise<string[]> {
   const resp = await fetch(`${API_BASE}/namespaces`);
   if (!resp.ok) throw new Error(`Failed to fetch namespaces: ${resp.status}`);
+  return resp.json();
+}
+
+/** Namespace path as array of segments, e.g. ["colorado", "water"] */
+export type NamespacePath = string[];
+
+export async function fetchNamespaceTree(): Promise<NamespacePath[]> {
+  const resp = await fetch(`${API_BASE}/namespaces/tree`);
+  if (!resp.ok)
+    throw new Error(`Failed to fetch namespace tree: ${resp.status}`);
   return resp.json();
 }
 

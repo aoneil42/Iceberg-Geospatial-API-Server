@@ -7,6 +7,7 @@ Both pygeoapi and the GeoServices endpoint call these functions.
 """
 
 import logging
+import os
 import re
 import threading
 
@@ -44,15 +45,20 @@ _FORBIDDEN_KEYWORDS = re.compile(
 _FORBIDDEN_PATTERNS = re.compile(r"(--|/\*|\*/|;)")
 
 _HAS_SPATIAL = None
+_DUCKDB_EXT_DIR = os.environ.get("DUCKDB_EXTENSION_DIR")
 
 
 def _get_connection() -> duckdb.DuckDBPyConnection:
     """Create a DuckDB connection, loading the spatial extension if available."""
     global _HAS_SPATIAL
     conn = duckdb.connect()
+    if _DUCKDB_EXT_DIR:
+        conn.execute(f"SET extension_directory = '{_DUCKDB_EXT_DIR}'")
+        conn.execute("SET autoinstall_known_extensions = false")
     if _HAS_SPATIAL is None:
         try:
-            conn.install_extension("spatial")
+            if not _DUCKDB_EXT_DIR:
+                conn.install_extension("spatial")
             conn.load_extension("spatial")
             _HAS_SPATIAL = True
         except Exception:

@@ -5,6 +5,7 @@ import {
 } from "@geoarrow/deck.gl-layers";
 import type { GeoArrowPickingInfo } from "@geoarrow/deck.gl-layers";
 import type { Table } from "apache-arrow";
+import { ScatterplotLayer } from "@deck.gl/layers";
 import type { Layer, Color, PickingInfo } from "@deck.gl/core";
 
 // ---------------------------------------------------------------------------
@@ -172,20 +173,21 @@ export function buildPolygonLayer(
         }
       : DEFAULT_POLYGON_FILL;
 
+  // Explicitly pass the geometry vector via getPolygon so the layer's
+  // _updateEarcut and renderLayers bypass getGeometryVector() lookup which
+  // can fail to match the extension name across bundled module boundaries.
+  const geomVector = table.getChild("geometry")!;
+
   return new GeoArrowSolidPolygonLayer({
     id,
     data: table,
     visible,
+    getPolygon: geomVector,
     getFillColor: fillColor,
     pickable: true,
     onClick: pickingHandler(onClick),
-    // Disable validation — the assert(isPolygonVector) can throw during
-    // renderLayers for valid data when internal type detection is strict.
     _validate: false,
-    // Enable normalization to handle all winding orders / coordinate edge cases.
     _normalize: true,
-    // Log earcut timing to console for debugging.
-    metrics: true,
   });
 }
 
@@ -215,4 +217,99 @@ export function buildAutoLayer(
       // Fall back to polygon layer for unknown types
       return buildPolygonLayer(table, visible, onClick, id);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate bubble layer — grid-binned centroids with feature counts
+// ---------------------------------------------------------------------------
+
+/** Semi-transparent orange for cluster bubbles */
+const AGGREGATE_FILL: Color = [255, 140, 0, 180];
+const AGGREGATE_STROKE: Color = [200, 100, 0, 255];
+
+interface AggregateRow {
+  position: [number, number];
+  count: number;
+}
+
+/**
+ * Build a bubble-map layer for server-aggregated (grid-binned) data.
+ * The input table has columns: geometry (GeoArrow Point), feature_count (int).
+ */
+export function buildAggregateLayer(
+  table: Table,
+  visible: boolean,
+  onClick?: FeatureClickHandler,
+  id: string = "aggregate"
+): Layer {
+  const n = table.numRows;
+  const geomCol = table.getChild("geometry");
+  const countCol = table.getChild("feature_count");
+
+  if (!geomCol || !countCol || n === 0) {
+    return new ScatterplotLayer<AggregateRow>({ id, data: [], visible });
+  }
+
+  // Extract positions and counts from the Arrow table.
+  // GeoArrow Point geometry is a FixedSizeList[2]<Float64>; access via .get(0/1).
+  // If WKB-encoded instead, coords are at byte offsets 5 (x) and 13 (y).
+  const rows: AggregateRow[] = new Array(n);
+  let maxCount = 1;
+
+  for (let i = 0; i < n; i++) {
+    const geom = geomCol.get(i);
+    let x = 0,
+      y = 0;
+    if (geom != null) {
+      if (typeof geom.get === "function") {
+        // GeoArrow FixedSizeList
+        x = geom.get(0);
+        y = geom.get(1);
+      } else if (geom instanceof Uint8Array && geom.byteLength >= 21) {
+        // WKB fallback — Point: byte-order(1) + type(4) + x(8) + y(8)
+        const dv = new DataView(
+          geom.buffer,
+          geom.byteOffset,
+          geom.byteLength
+        );
+        const le = geom[0] === 1;
+        x = dv.getFloat64(5, le);
+        y = dv.getFloat64(13, le);
+      }
+    }
+    const c = countCol.get(i) ?? 1;
+    rows[i] = { position: [x, y], count: c };
+    if (c > maxCount) maxCount = c;
+  }
+
+  const sqrtMax = Math.sqrt(maxCount);
+
+  return new ScatterplotLayer<AggregateRow>({
+    id,
+    data: rows,
+    visible,
+    getPosition: (d) => d.position,
+    getRadius: (d) => {
+      // Radius proportional to sqrt(count) for perceptual area scaling
+      const normalized = Math.sqrt(d.count) / sqrtMax;
+      return 4000 + normalized * 46000;
+    },
+    getFillColor: AGGREGATE_FILL,
+    getLineColor: AGGREGATE_STROKE,
+    stroked: true,
+    lineWidthMinPixels: 1,
+    radiusMinPixels: 6,
+    radiusMaxPixels: 40,
+    pickable: true,
+    onClick: (info: PickingInfo) => {
+      if (!onClick || !info.object) return;
+      const obj = info.object as AggregateRow;
+      onClick({
+        type: `${id} (aggregated)`,
+        feature_count: obj.count,
+        longitude: obj.position[0],
+        latitude: obj.position[1],
+      });
+    },
+  });
 }

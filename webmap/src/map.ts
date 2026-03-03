@@ -8,12 +8,67 @@ let map: maplibregl.Map;
 let deckOverlay: MapboxOverlay | null = null;
 let pendingLayers: Layer[] | null = null;
 
+// Track current layers so they survive basemap switches
+let currentLayers: Layer[] = [];
+
 // Global initial view (no data loaded yet)
 const INITIAL_CENTER: [number, number] = [0, 20];
 const INITIAL_ZOOM = 2;
 
-// OpenFreeMap provides free vector tiles with no API key required.
-const BASEMAP_STYLE = "https://tiles.openfreemap.org/styles/liberty";
+// ---------------------------------------------------------------------------
+// Basemap configuration
+// ---------------------------------------------------------------------------
+
+export interface BasemapConfig {
+  name: string;
+  style: string;
+  token?: string;
+}
+
+let basemaps: BasemapConfig[] = [];
+let currentBasemapIndex = 0;
+
+/**
+ * Load basemap configuration.
+ * Priority: VITE_BASEMAP_STYLE env var > /basemaps.json > hardcoded fallback.
+ */
+export async function loadBasemapConfig(): Promise<BasemapConfig[]> {
+  const envStyle = import.meta.env.VITE_BASEMAP_STYLE;
+  if (envStyle) {
+    basemaps = [{ name: "Default", style: envStyle }];
+    return basemaps;
+  }
+
+  try {
+    const resp = await fetch("/basemaps.json");
+    if (resp.ok) {
+      const parsed = await resp.json();
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        basemaps = parsed;
+        return basemaps;
+      }
+    }
+  } catch {
+    // fall through to default
+  }
+
+  basemaps = [
+    { name: "Liberty", style: "https://tiles.openfreemap.org/styles/liberty" },
+  ];
+  return basemaps;
+}
+
+export function getBasemaps(): BasemapConfig[] {
+  return basemaps;
+}
+
+export function getCurrentBasemapIndex(): number {
+  return currentBasemapIndex;
+}
+
+// ---------------------------------------------------------------------------
+// Deck.gl canvas sync
+// ---------------------------------------------------------------------------
 
 /**
  * Sync the deck.gl canvas to match the map canvas dimensions.
@@ -75,12 +130,32 @@ function attachOverlay() {
   window.addEventListener("resize", () => syncDeckCanvas());
 }
 
-export function initMap(): maplibregl.Map {
+// ---------------------------------------------------------------------------
+// Map init + basemap switching
+// ---------------------------------------------------------------------------
+
+export function initMap(style: string): maplibregl.Map {
   map = new maplibregl.Map({
     container: "map",
-    style: BASEMAP_STYLE,
+    style,
     center: INITIAL_CENTER,
     zoom: INITIAL_ZOOM,
+    transformRequest: (url: string) => {
+      // Append token for basemaps that require authentication
+      const current = basemaps[currentBasemapIndex];
+      if (current?.token) {
+        try {
+          const styleOrigin = new URL(current.style).origin;
+          if (url.startsWith(styleOrigin)) {
+            const sep = url.includes("?") ? "&" : "?";
+            return { url: `${url}${sep}token=${current.token}` };
+          }
+        } catch {
+          // invalid style URL — skip transform
+        }
+      }
+      return { url };
+    },
   });
 
   map.addControl(new maplibregl.NavigationControl(), "top-right");
@@ -96,7 +171,34 @@ export function initMap(): maplibregl.Map {
   return map;
 }
 
+/**
+ * Switch to a different basemap by index.
+ * Re-attaches the deck.gl overlay and preserves current data layers.
+ */
+export function switchBasemap(index: number): void {
+  if (index < 0 || index >= basemaps.length) return;
+  currentBasemapIndex = index;
+  const config = basemaps[index];
+
+  map.setStyle(config.style);
+
+  map.once("style.load", () => {
+    // Remove old overlay and re-attach with current layers
+    if (deckOverlay) {
+      map.removeControl(deckOverlay);
+      deckOverlay = null;
+    }
+    pendingLayers = currentLayers;
+    attachOverlay();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Layer management
+// ---------------------------------------------------------------------------
+
 export function setLayers(newLayers: Layer[]): void {
+  currentLayers = newLayers;
   if (deckOverlay) {
     deckOverlay.setProps({ layers: newLayers });
   } else {
@@ -139,7 +241,6 @@ export function getViewportBbox(): Bbox {
 export function getMap(): maplibregl.Map {
   return map;
 }
-
 export function getOverlay(): MapboxOverlay | null {
   return deckOverlay;
 }
