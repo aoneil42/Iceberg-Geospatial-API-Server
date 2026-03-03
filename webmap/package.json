@@ -9,13 +9,13 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@deck.gl/core": "^9.2.0",
-    "@deck.gl/layers": "^9.2.0",
-    "@deck.gl/mapbox": "^9.2.0",
+    "@deck.gl/core": "^9.1.0",
+    "@deck.gl/layers": "^9.1.0",
+    "@deck.gl/mapbox": "^9.1.0",
     "@geoarrow/deck.gl-layers": "^0.3.1",
     "@geoarrow/geoparquet-wasm": "0.2.0-beta.5",
     "apache-arrow": ">=15",
-    "maplibre-gl": "^5.17.0"
+    "maplibre-gl": "^5.1.0"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

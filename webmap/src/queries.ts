@@ -4,13 +4,12 @@ import type { Table } from "apache-arrow";
 const API_BASE = "/api";
 
 /** Feature limits per geometry type.
- *  Points/lines are cheap to render; polygons require earcut triangulation
- *  which is O(n·vertices) so we keep that limit much lower.
- *  10K polygons ≈ 2–3s earcut; 50K was causing timeouts where moveend
- *  reloads restart earcut before it finishes, making polygons never render. */
+ *  The GeoArrow pipeline handles large datasets well; the real OOM guard is
+ *  MAX_RESPONSE_BYTES (256 MB) in geoarrow.ts.  Earcut cooldowns in main.ts
+ *  prevent moveend reloads from restarting triangulation mid-flight. */
 export const MAX_FEATURES_POINT = 200_000;
 export const MAX_FEATURES_LINE = 200_000;
-export const MAX_FEATURES_POLYGON = 10_000;
+export const MAX_FEATURES_POLYGON = 2_000_000;
 
 export type Bbox = [number, number, number, number];
 

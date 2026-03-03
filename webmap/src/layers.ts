@@ -173,21 +173,20 @@ export function buildPolygonLayer(
         }
       : DEFAULT_POLYGON_FILL;
 
-  // Explicitly pass the geometry vector via getPolygon so the layer's
-  // _updateEarcut and renderLayers bypass getGeometryVector() lookup which
-  // can fail to match the extension name across bundled module boundaries.
-  const geomVector = table.getChild("geometry")!;
-
   return new GeoArrowSolidPolygonLayer({
     id,
     data: table,
     visible,
-    getPolygon: geomVector,
     getFillColor: fillColor,
     pickable: true,
     onClick: pickingHandler(onClick),
+    // Disable validation — the assert(isPolygonVector) can throw during
+    // renderLayers for valid data when internal type detection is strict.
     _validate: false,
+    // Enable normalization to handle all winding orders / coordinate edge cases.
     _normalize: true,
+    // Log earcut timing to console for debugging.
+    metrics: true,
   });
 }
 
@@ -277,7 +276,9 @@ export function buildAggregateLayer(
         y = dv.getFloat64(13, le);
       }
     }
-    const c = countCol.get(i) ?? 1;
+    const raw = countCol.get(i) ?? 1;
+    // DuckDB COUNT(*) produces BigInt64 in Arrow — coerce to Number
+    const c = typeof raw === "bigint" ? Number(raw) : (raw as number);
     rows[i] = { position: [x, y], count: c };
     if (c > maxCount) maxCount = c;
   }

@@ -198,17 +198,13 @@ const handleClick: FeatureClickHandler = (info) => {
 // Layer loading with viewport bbox
 // ---------------------------------------------------------------------------
 
-/** Return the appropriate feature limit for a given geometry type and zoom.
- *  Polygon limits scale with zoom: simplified polygons at low zoom are cheap,
- *  so we allow more; full-resolution polygons at high zoom stay conservative. */
-function getEffectiveLimit(gt?: GeomType, zoom?: number): number {
+/** Return the appropriate feature limit for a given geometry type.
+ *  The GeoArrow pipeline + earcut cooldowns handle large polygon counts;
+ *  the real OOM guard is MAX_RESPONSE_BYTES (256 MB) in geoarrow.ts. */
+function getEffectiveLimit(gt?: GeomType, _zoom?: number): number {
   switch (gt) {
-    case "polygon": {
-      const z = zoom ?? 12;
-      if (z < 8) return 50_000;   // simplified — earcut is fast
-      if (z < 12) return 20_000;  // moderate simplification
-      return MAX_FEATURES_POLYGON; // full resolution
-    }
+    case "polygon":
+      return MAX_FEATURES_POLYGON;
     case "line":
       return MAX_FEATURES_LINE;
     case "point":
@@ -251,7 +247,14 @@ async function loadLayerWithViewport(
   const fetchBbox = expandBbox(viewportBbox, 1.5);
   const knownType = geomTypes.get(key);
   const zoom = getMap().getZoom();
-  const useAggregate = zoom < AGGREGATE_ZOOM_THRESHOLD;
+  // Only aggregate point layers — polygons and lines need their actual
+  // geometry for rendering.  Polygons use simplification + feature limits
+  // instead, which keeps them renderable at any zoom.
+  // On first load (knownType undefined), always fetch non-aggregated with a
+  // conservative limit so we can detect the geometry type from the response.
+  const useAggregate =
+    zoom < AGGREGATE_ZOOM_THRESHOLD &&
+    knownType === "point";
 
   setTreeLayerLoading(ns, layer, true);
   try {
@@ -263,8 +266,6 @@ async function loadLayerWithViewport(
         { resolution }
       );
       tables.set(key, table);
-      // Preserve original geom type if known; aggregated data is always points
-      if (!knownType) geomTypes.set(key, "point");
       aggregatedKeys.add(key);
       loadedBbox.set(key, fetchBbox);
       loadedZoom.set(key, zoom);
@@ -414,18 +415,21 @@ async function main() {
   async function reloadVisibleLayers() {
     const bbox = getViewportBbox();
     const currentZoom = getMap().getZoom();
-    const shouldAggregate = currentZoom < AGGREGATE_ZOOM_THRESHOLD;
 
     const reloadKeys = [...visibleSet].filter((key) => {
       if (loadingKeys.has(key)) return false;
       if (earcutCooldownKeys.has(key)) return false;
 
-      // Always reload if we crossed the aggregate/full-res threshold
+      const gt = geomTypes.get(key);
+      // Only point layers aggregate; polygons/lines/unknown never do
+      const shouldAggregate = gt === "point" && currentZoom < AGGREGATE_ZOOM_THRESHOLD;
+
+      // Reload if we crossed the aggregate/full-res threshold (points only)
       const wasAggregated = aggregatedKeys.has(key);
       if (wasAggregated !== shouldAggregate) return true;
 
       // In aggregate mode, reload if the resolution bucket changed
-      if (shouldAggregate) {
+      if (shouldAggregate && wasAggregated) {
         const prevZoom = loadedZoom.get(key);
         if (prevZoom !== undefined) {
           if (getAggregateResolution(prevZoom) !== getAggregateResolution(currentZoom))
