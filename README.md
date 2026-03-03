@@ -191,6 +191,8 @@ sedona.sql("""
 | POST | `/api/upload` | Upload GeoJSON/GeoParquet files |
 | GET | `/api/docs` | Swagger UI |
 | GET | `/api/health` | Health check |
+| WS | `/ws/agent/{session_id}` | WebSocket for agent layer_ready push events |
+| POST | `/api/agent/notify/{session_id}` | Agent calls this after materializing a result |
 
 ### OGC API Features (pygeoapi)
 
@@ -317,8 +319,9 @@ lakehouse/
 │   ├── duckdb-mcp-init.sql      # DuckDB init: extensions + catalog
 │   └── entrypoint.sh            # Env templating + LakeKeeper wait
 ├── api/                         # FastAPI + DuckDB feature service
-│   ├── Dockerfile
-│   ├── main.py                  # Routes, upload, namespace management
+│   ├── Dockerfile               # Non-root user + HEALTHCHECK
+│   ├── .dockerignore
+│   ├── main.py                  # Routes, upload, WebSocket, agent notify
 │   └── requirements.txt
 ├── iceberg-geo-api/             # Esri GeoServices + OGC API
 │   ├── Dockerfile.geoservices
@@ -335,13 +338,17 @@ lakehouse/
 │   └── tests/
 ├── webmap/                      # deck.gl + MapLibre frontend
 │   ├── Dockerfile
-│   ├── nginx.conf               # Reverse proxy + URL rewriting
+│   ├── nginx.conf               # Reverse proxy + WebSocket upgrade + agent proxy
+│   ├── .env                     # VITE_AGENT_ENABLED=false (default)
+│   ├── .env.agent               # VITE_AGENT_ENABLED=true  (copy to .env to enable)
 │   ├── src/
-│   │   ├── main.ts              # App entry, dataset loading
+│   │   ├── main.ts              # App entry, dataset loading, agent integration
 │   │   ├── map.ts               # MapLibre + deck.gl setup
 │   │   ├── layers.ts            # deck.gl layer definitions
-│   │   ├── queries.ts           # DuckDB-WASM queries
-│   │   └── ui.ts                # Namespace tree, layer toggles
+│   │   ├── queries.ts           # API queries (GeoParquet fetch)
+│   │   ├── ui.ts                # Namespace tree, layer toggles
+│   │   ├── agent-ws.ts          # WebSocket client for agent events (feature-flagged)
+│   │   └── chat-panel.ts        # Chat panel UI component (feature-flagged)
 │   └── public/data/             # Static Parquet files (git-ignored)
 └── notebooks/                   # Jupyter notebooks
     ├── colorado_sample_data.ipynb
@@ -394,3 +401,123 @@ Memory limits are set per-service in `docker-compose.yml` and can be tuned.
 - **DuckDB Iceberg writes**: Write support is new (v1.3+). Use SedonaSpark or PyIceberg for heavy writes and table creation.
 - **Table maintenance**: Compaction, snapshot expiry, and orphan file cleanup require SedonaSpark or PyIceberg.
 - **Single-node Garage**: Replication factor is 1 (dev mode). Not for production data durability.
+
+## Agent Integration (Tier 3)
+
+The webmap includes an optional chat panel for natural-language spatial queries.
+When enabled, users type questions like "show me all parcels within 500m of
+the river" and the agent translates them to spatial SQL, executes via MCP tools,
+and pushes results to the map in real time.
+
+All agent functionality is gated behind a build-time feature flag. When disabled
+(the default), zero agent code is loaded and the webmap is identical to before.
+
+### Feature Flag
+
+The agent UI is controlled by `VITE_AGENT_ENABLED` in `webmap/.env`:
+
+```bash
+# Default — agent disabled, no chat panel, no WebSocket, no toggle button
+VITE_AGENT_ENABLED=false
+
+# Enable — chat panel + agent toggle button appear in the webmap
+VITE_AGENT_ENABLED=true
+```
+
+To enable the agent UI:
+
+```bash
+# Option 1: Copy the agent env file
+cp webmap/.env.agent webmap/.env
+
+# Option 2: Edit directly
+echo "VITE_AGENT_ENABLED=true" > webmap/.env
+```
+
+**Rebuild required after changing the flag:**
+
+```bash
+# Dev mode (hot-reload picks it up automatically on restart)
+cd webmap && npm run dev
+
+# Production Docker build
+docker compose build webmap
+docker compose up -d webmap
+```
+
+### Requirements
+
+- The `spatial-lakehouse-agent` container (separate repo) running on port 8090
+- `VITE_AGENT_ENABLED=true` in `webmap/.env` (rebuild after changing)
+
+### Architecture
+
+```
+┌─────────────┐     POST /api/agent/chat      ┌───────────────┐
+│   Webmap     │ ──────────────────────────────▶│  Agent (8090) │
+│  Chat Panel  │                                │  (future repo)│
+└──────┬───────┘                                └───────┬───────┘
+       │ ws://.../ws/agent/{session_id}                 │
+       │                                                │ MCP tools
+       ▼                                                ▼
+┌──────────────┐   POST /api/agent/notify/{id}  ┌──────────────┐
+│   FastAPI     │◀─────────────────────────────── │  MCP Server  │
+│   (8000)     │                                 │  (8082)      │
+└──────────────┘                                 └──────────────┘
+       │ ws push LayerReadyEvent
+       ▼
+   Webmap loads layer via existing REST pipeline
+```
+
+1. User types a question in the chat panel
+2. Chat panel POSTs to `/api/agent/chat` → nginx proxies to agent container (8090)
+3. Agent generates SQL, calls MCP `materialize_result` with scratch namespace
+4. Agent POSTs to `/api/agent/notify/{session_id}` on the lakehouse API
+5. Lakehouse API computes bbox, pushes `layer_ready` event via WebSocket
+6. Webmap receives event, loads layer via existing GeoParquet pipeline
+7. Map flies to result extent
+
+### Running Without the Agent
+
+When `VITE_AGENT_ENABLED=false` (the default), the chat panel and agent toggle
+button are completely absent from the built JavaScript. The webmap behaves
+identically to the non-agent deployment. No WebSocket connections are attempted.
+The `agent-ws.ts` and `chat-panel.ts` modules are not even loaded.
+
+When `VITE_AGENT_ENABLED=true` but the agent container is not running:
+- The toggle button appears in the top-right corner
+- Clicking it opens the chat panel
+- The WebSocket status dot shows red ("Agent unavailable")
+- Sending a message returns "Agent is not running" (nginx 502)
+- The map continues to function normally
+
+### Running With the Agent
+
+The agent container lives in a separate `spatial-lakehouse-agent` repo and joins
+the lakehouse Docker network:
+
+```bash
+# Start the lakehouse (with agent flag enabled in webmap/.env)
+docker compose up -d
+
+# Start the agent (from the agent repo, using a compose override)
+docker compose -f docker-compose.yml \
+  -f ../spatial-lakehouse-agent/docker-compose.agent.yml up -d
+```
+
+The agent's `docker-compose.agent.yml` defines a `spatial-agent` service on port
+8090 that joins the `lakehouse` network. nginx proxies `/api/agent/` to it.
+
+### Session Isolation
+
+Each browser tab generates a unique session UUID via `crypto.randomUUID()`. The
+agent creates scratch tables in `lakehouse._scratch_{session_id[:8]}`. When the
+WebSocket disconnects (tab close or panel close), the API drops the scratch
+namespace automatically via `DROP SCHEMA IF EXISTS ... CASCADE`.
+
+### Nginx Proxy Routes (Agent)
+
+| Location | Target | Purpose |
+|----------|--------|---------|
+| `/ws/` | `lakehouse-api:8000` | WebSocket upgrade for agent push events |
+| `/api/agent/` | `spatial-agent:8090` | Agent chat API (502 when absent) |

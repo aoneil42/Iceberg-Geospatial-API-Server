@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import json
 import os
 import re
 import tempfile
 import threading
+import time
 
 import duckdb
 import urllib.request
@@ -17,11 +20,14 @@ app = FastAPI(docs_url="/api/docs", openapi_url="/api/openapi.json")
 
 CATALOG_URL = os.environ.get("CATALOG_URL", "http://lakekeeper:8181/catalog")
 
-_conn: duckdb.DuckDBPyConnection | None = None
-_lock = threading.Lock()
+_pool: DuckDBPool | None = None
 _catalog_prefix: str | None = None
 
 _VALID_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+# Schema cache: keyed by "namespace.layer.metadata_loc" → (timestamp, cols_info)
+_schema_cache: dict[str, tuple[float, list]] = {}
+_SCHEMA_CACHE_TTL = 60  # seconds
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +61,8 @@ def _get_metadata_location(namespace: str, layer: str) -> str:
 def _init_connection() -> duckdb.DuckDBPyConnection:
     conn = duckdb.connect()
 
+    # Ensure DuckDB has a writable home directory for extension caching
+    conn.execute("SET home_directory = '/tmp'")
     conn.execute("INSTALL httpfs; LOAD httpfs;")
     conn.execute("INSTALL iceberg; LOAD iceberg;")
     conn.execute("INSTALL spatial; LOAD spatial;")
@@ -79,10 +87,38 @@ def _init_connection() -> duckdb.DuckDBPyConnection:
     return conn
 
 
+class DuckDBPool:
+    """Thread-safe pool of DuckDB connections.
+
+    Each connection is fully initialized (extensions, S3 secret).
+    Callers acquire a connection via the context manager and release
+    it automatically when the block exits.
+    """
+
+    def __init__(self, size: int = 4):
+        self._sem = threading.Semaphore(size)
+        self._conns: collections.deque[duckdb.DuckDBPyConnection] = (
+            collections.deque()
+        )
+        for _ in range(size):
+            self._conns.append(_init_connection())
+
+    @contextlib.contextmanager
+    def acquire(self):
+        self._sem.acquire()
+        conn = self._conns.popleft()
+        try:
+            yield conn
+        finally:
+            self._conns.append(conn)
+            self._sem.release()
+
+
 @app.on_event("startup")
 def startup() -> None:
-    global _conn
-    _conn = _init_connection()
+    global _pool
+    size = int(os.environ.get("DUCKDB_POOL_SIZE", "4"))
+    _pool = DuckDBPool(size)
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +172,8 @@ def _compute_bbox(source: str) -> tuple[float, float, float, float] | None:
         f"MAX(ST_XMax(g)), MAX(ST_YMax(g)) "
         f"FROM (SELECT ST_GeomFromWKB(geometry) AS g FROM {source})"
     )
-    with _lock:
-        row = _conn.execute(sql).fetchone()  # type: ignore[union-attr]
+    with _pool.acquire() as conn:  # type: ignore[union-attr]
+        row = conn.execute(sql).fetchone()
     if row and row[0] is not None:
         return (row[0], row[1], row[2], row[3])
     return None
@@ -230,6 +266,9 @@ def get_features(
     layer: str,
     bbox: str | None = Query(default=None, description="minx,miny,maxx,maxy"),
     limit: int | None = Query(default=None, ge=1),
+    simplify: float | None = Query(
+        default=None, ge=0, description="Simplification tolerance in degrees"
+    ),
 ) -> Response:
     if not _VALID_NAME.match(namespace):
         return JSONResponse(
@@ -251,25 +290,43 @@ def get_features(
 
     source = f"iceberg_scan('{metadata_loc}')"
 
-    # Introspect columns: detect geometry type and flatten STRUCTs so that
-    # the output GeoParquet only has flat (non-nested) columns — GeoArrow
-    # deck.gl layers don't handle nested structs well.
-    with _lock:
-        cols_info = _conn.execute(  # type: ignore[union-attr]
-            f"SELECT column_name, column_type "
-            f"FROM (DESCRIBE SELECT * FROM {source} LIMIT 0)"
-        ).fetchall()
+    # Introspect columns (cached for 60s per table version).
+    # Detects geometry type and flattens STRUCTs — GeoArrow deck.gl layers
+    # don't handle nested structs well.
+    cache_key = f"{namespace}.{layer}.{metadata_loc}"
+    cached = _schema_cache.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < _SCHEMA_CACHE_TTL:
+        cols_info = cached[1]
+    else:
+        with _pool.acquire() as conn:  # type: ignore[union-attr]
+            cols_info = conn.execute(
+                f"SELECT column_name, column_type "
+                f"FROM (DESCRIBE SELECT * FROM {source} LIMIT 0)"
+            ).fetchall()
+        _schema_cache[cache_key] = (time.monotonic(), cols_info)
 
     col_map: dict[str, str] = {c[0]: c[1] for c in cols_info}
     geom_col_type = col_map.get("geometry", "BLOB").upper()
 
-    # Build geometry expression based on actual column type
+    # Build geometry expression based on actual column type.
+    # Output must be DuckDB GEOMETRY type for COPY TO PARQUET to produce
+    # valid GeoParquet with proper extension metadata.
     if "GEOMETRY" in geom_col_type:
-        geom_expr = "ST_AsWKB(geometry) AS geometry"
         geom_from = "ST_GeomFromWKB(ST_AsWKB(geometry))"
     else:
-        geom_expr = "ST_GeomFromWKB(geometry) AS geometry"
         geom_from = "ST_GeomFromWKB(geometry)"
+
+    # Optionally simplify geometry (Douglas-Peucker) for low-zoom rendering
+    if simplify and simplify > 0:
+        if "GEOMETRY" in geom_col_type:
+            geom_expr = f"ST_Simplify(geometry, {simplify}) AS geometry"
+        else:
+            geom_expr = f"ST_Simplify(ST_GeomFromWKB(geometry), {simplify}) AS geometry"
+    else:
+        if "GEOMETRY" in geom_col_type:
+            geom_expr = "ST_AsWKB(geometry) AS geometry"
+        else:
+            geom_expr = "ST_GeomFromWKB(geometry) AS geometry"
 
     # Build column list, flattening any STRUCT columns into their fields.
     # DuckDB's "col.*" expands a STRUCT into its child columns.
@@ -301,16 +358,25 @@ def get_features(
     where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
     limit_clause = f" LIMIT {limit}" if limit else ""
 
+    # Total count (before LIMIT) for truncation detection
+    total_count: int | None = None
+    if limit:
+        count_sql = f"SELECT COUNT(*) FROM {source}{where}"
+        with _pool.acquire() as conn:  # type: ignore[union-attr]
+            row = conn.execute(count_sql).fetchone()
+        total_count = row[0] if row else 0
+
     # Put geometry first (matches the column order readGeoParquet expects),
     # and convert WKB binary → DuckDB GEOMETRY so COPY TO writes GeoParquet.
     sql = f"SELECT {', '.join(select_parts)} FROM {source}{where}{limit_clause}"
 
-    # Use DuckDB's native Parquet writer (produces correct GeoParquet encoding)
+    # Use DuckDB's native Parquet writer (produces correct GeoParquet encoding
+    # with proper GeoArrow extension metadata that readGeoParquet WASM needs).
     fd, tmppath = tempfile.mkstemp(suffix=".parquet")
     os.close(fd)
     try:
-        with _lock:
-            _conn.execute(  # type: ignore[union-attr]
+        with _pool.acquire() as conn:  # type: ignore[union-attr]
+            conn.execute(
                 f"COPY ({sql}) TO '{tmppath}' (FORMAT PARQUET)"
             )
         with open(tmppath, "rb") as f:
@@ -318,9 +384,15 @@ def get_features(
     finally:
         os.unlink(tmppath)
 
+    headers: dict[str, str] = {}
+    if total_count is not None:
+        headers["X-Total-Count"] = str(total_count)
+        headers["X-Truncated"] = str(limit is not None and total_count > limit).lower()
+
     return Response(
         content=data,
         media_type="application/x-parquet",
+        headers=headers or None,
     )
 
 
@@ -679,18 +751,18 @@ def _read_upload(tmp_path: str, fmt: str):
 
 def _read_geojson(tmp_path: str):
     """Read GeoJSON via DuckDB ST_Read → Arrow table with WKB geometry."""
-    with _lock:
-        _conn.execute("DROP TABLE IF EXISTS __upload")  # type: ignore[union-attr]
-        _conn.execute(  # type: ignore[union-attr]
+    with _pool.acquire() as conn:  # type: ignore[union-attr]
+        conn.execute("DROP TABLE IF EXISTS __upload")
+        conn.execute(
             f"CREATE TEMP TABLE __upload AS "
             f"SELECT * FROM ST_Read('{tmp_path}')"
         )
         # ST_Read produces a 'geom' column of type GEOMETRY
-        arrow_table = _conn.execute(  # type: ignore[union-attr]
+        arrow_table = conn.execute(
             "SELECT ST_AsWKB(geom) AS geometry, "
             "* EXCLUDE (geom) FROM __upload"
         ).fetch_arrow_table()
-        _conn.execute("DROP TABLE IF EXISTS __upload")  # type: ignore[union-attr]
+        conn.execute("DROP TABLE IF EXISTS __upload")
     return arrow_table
 
 
@@ -698,15 +770,15 @@ def _read_geoparquet(tmp_path: str):
     """Read GeoParquet via DuckDB → Arrow table with WKB geometry."""
     geom_col, encoding = _detect_geom_column_geoparquet(tmp_path)
 
-    with _lock:
-        _conn.execute("DROP TABLE IF EXISTS __upload")  # type: ignore[union-attr]
-        _conn.execute(  # type: ignore[union-attr]
+    with _pool.acquire() as conn:  # type: ignore[union-attr]
+        conn.execute("DROP TABLE IF EXISTS __upload")
+        conn.execute(
             f"CREATE TEMP TABLE __upload AS "
             f"SELECT * FROM read_parquet('{tmp_path}')"
         )
 
         # Build the SELECT: convert geometry to WKB, keep everything else
-        cols = _conn.execute(  # type: ignore[union-attr]
+        cols = conn.execute(
             "SELECT column_name, data_type FROM information_schema.columns "
             "WHERE table_name = '__upload' ORDER BY ordinal_position"
         ).fetchall()
@@ -735,10 +807,10 @@ def _read_geoparquet(tmp_path: str):
             # No geometry detected — pass through as-is
             select = "*"
 
-        arrow_table = _conn.execute(  # type: ignore[union-attr]
+        arrow_table = conn.execute(
             f"SELECT {select} FROM __upload"
         ).fetch_arrow_table()
-        _conn.execute("DROP TABLE IF EXISTS __upload")  # type: ignore[union-attr]
+        conn.execute("DROP TABLE IF EXISTS __upload")
 
     return arrow_table
 
@@ -751,3 +823,139 @@ def _read_geoparquet(tmp_path: str):
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Tier 3 Agent Integration (additive — no-op when agent is not connected)
+# ---------------------------------------------------------------------------
+
+from fastapi import WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+from typing import Dict, List
+import asyncio
+
+
+class LayerNotification(BaseModel):
+    """Payload sent by the agent after materializing a result."""
+    namespace: str
+    table: str
+    row_count: int
+    description: str = ""
+
+
+class ConnectionManager:
+    """Track WebSocket connections per agent session.
+
+    Cleanup of scratch namespaces runs asynchronously with a 30-second
+    grace period so that brief reconnections (page reload, network blip)
+    don't drop materialized data.
+    """
+
+    def __init__(self):
+        self.active: Dict[str, List[WebSocket]] = {}
+        self._cleanup_tasks: Dict[str, asyncio.Task] = {}
+
+    async def connect(self, session_id: str, ws: WebSocket):
+        await ws.accept()
+        # Cancel any pending cleanup for this session (reconnection)
+        task = self._cleanup_tasks.pop(session_id, None)
+        if task:
+            task.cancel()
+        self.active.setdefault(session_id, []).append(ws)
+
+    def disconnect(self, session_id: str, ws: WebSocket):
+        conns = self.active.get(session_id, [])
+        if ws in conns:
+            conns.remove(ws)
+        if not conns and session_id in self.active:
+            del self.active[session_id]
+            # Schedule async cleanup with grace period
+            self._cleanup_tasks[session_id] = asyncio.create_task(
+                self._delayed_cleanup(session_id)
+            )
+
+    async def send_to_session(self, session_id: str, data: dict):
+        for ws in self.active.get(session_id, []):
+            try:
+                await ws.send_json(data)
+            except Exception:
+                pass  # stale connection; will be cleaned on next disconnect
+
+    async def _delayed_cleanup(self, session_id: str):
+        """Drop scratch namespace after a 30-second grace period."""
+        await asyncio.sleep(30)
+        short_id = session_id.replace("-", "")[:8]
+        scratch_ns = f"_scratch_{short_id}"
+        try:
+            def _drop():
+                with _pool.acquire() as conn:  # type: ignore[union-attr]
+                    conn.execute(
+                        f"DROP SCHEMA IF EXISTS lakehouse.{scratch_ns} CASCADE"
+                    )
+            await asyncio.to_thread(_drop)
+        except Exception:
+            pass  # scratch namespace may not exist; that's fine
+        self._cleanup_tasks.pop(session_id, None)
+
+
+_ws_manager = ConnectionManager()
+
+
+@app.websocket("/ws/agent/{session_id}")
+async def agent_websocket(websocket: WebSocket, session_id: str):
+    """
+    WebSocket for push-based layer notifications from the agent.
+
+    The webmap connects here on chat panel open. The agent triggers
+    layer_ready events via POST /api/agent/notify/{session_id}, which
+    this endpoint relays to all connected webmap clients for that session.
+    """
+    await _ws_manager.connect(session_id, websocket)
+    try:
+        while True:
+            # Keep-alive: read pings from client, ignore payload
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        _ws_manager.disconnect(session_id, websocket)
+
+
+@app.post("/api/agent/notify/{session_id}")
+async def agent_notify(session_id: str, payload: LayerNotification):
+    """
+    Called by the agent after materialize_result completes.
+
+    Computes the bbox of the new table (off the event loop via to_thread)
+    and pushes a layer_ready event to all webmap clients for this session.
+    """
+    bbox = None
+    try:
+        qualified = f"lakehouse.{payload.namespace}.{payload.table}"
+
+        def _compute_bbox():
+            with _pool.acquire() as conn:  # type: ignore[union-attr]
+                result = conn.execute(f"""
+                    SELECT
+                        ST_XMin(ST_Extent(geom)) as xmin,
+                        ST_YMin(ST_Extent(geom)) as ymin,
+                        ST_XMax(ST_Extent(geom)) as xmax,
+                        ST_YMax(ST_Extent(geom)) as ymax
+                    FROM iceberg_scan('{qualified}')
+                """).fetchone()
+            if result and result[0] is not None:
+                return [result[0], result[1], result[2], result[3]]
+            return None
+
+        bbox = await asyncio.to_thread(_compute_bbox)
+    except Exception:
+        pass  # bbox computation failed; layer_ready still fires without bbox
+
+    event = {
+        "type": "layer_ready",
+        "namespace": payload.namespace,
+        "table": payload.table,
+        "row_count": payload.row_count,
+        "bbox": bbox,
+        "description": payload.description,
+    }
+    await _ws_manager.send_to_session(session_id, event)
+    return {"status": "notified", "session_id": session_id}

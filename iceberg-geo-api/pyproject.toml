@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "pyiceberg[pyarrow,duckdb,s3]>=0.11.0",
-    "duckdb>=1.1.0",
+    "duckdb>=1.4.0",
     "shapely>=2.0",
     "pyproj>=3.6",
     "pydantic>=2.0",

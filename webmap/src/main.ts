@@ -14,6 +14,7 @@ import {
   fetchNamespaces,
   fetchTables,
   fetchTableBbox,
+  expandBbox,
   MAX_FEATURES_POINT,
   MAX_FEATURES_LINE,
   MAX_FEATURES_POLYGON,
@@ -172,14 +173,20 @@ const handleClick: FeatureClickHandler = (info) => {
 // Layer loading with viewport bbox
 // ---------------------------------------------------------------------------
 
-/** Return the appropriate feature limit for a given geometry type.
+/** Return the appropriate feature limit for a given geometry type and zoom.
+ *  Polygon limits scale with zoom: simplified polygons at low zoom are cheap,
+ *  so we allow more; full-resolution polygons at high zoom stay conservative.
  *  Respects the user-configurable override if set. */
-function getEffectiveLimit(gt?: GeomType): number {
+function getEffectiveLimit(gt?: GeomType, zoom?: number): number {
   // userLimit === null → use defaults; userLimit === 0 → unlimited (very high)
   if (userLimit !== null) return userLimit === 0 ? 10_000_000 : userLimit;
   switch (gt) {
-    case "polygon":
-      return MAX_FEATURES_POLYGON;
+    case "polygon": {
+      const z = zoom ?? 12;
+      if (z < 8) return 50_000;   // simplified — earcut is fast
+      if (z < 12) return 20_000;  // moderate simplification
+      return MAX_FEATURES_POLYGON; // full resolution
+    }
     case "line":
       return MAX_FEATURES_LINE;
     case "point":
@@ -187,6 +194,21 @@ function getEffectiveLimit(gt?: GeomType): number {
     default:
       return MAX_FEATURES_POLYGON; // conservative for unknown
   }
+}
+
+/** Compute simplification tolerance for a given zoom level.
+ *  Returns undefined above zoom 12 (full resolution). */
+function getSimplifyTolerance(zoom: number): number | undefined {
+  if (zoom >= 12) return undefined;
+  return 360 / (Math.pow(2, zoom) * 256);
+}
+
+/** Scale earcut cooldown based on polygon count. */
+function getEarcutCooldown(numRows: number): number {
+  if (numRows < 1_000) return 2_000;
+  if (numRows < 10_000) return 5_000;
+  if (numRows < 50_000) return 10_000;
+  return 20_000;
 }
 
 /** Load (or reload) a layer using the current viewport bbox. */
@@ -200,17 +222,22 @@ async function loadLayerWithViewport(
   if (loadingKeys.has(key)) return;
   loadingKeys.add(key);
 
-  const bbox = getViewportBbox();
+  const viewportBbox = getViewportBbox();
+  // Fetch 1.5x the viewport so small pans don't trigger refetches
+  const fetchBbox = expandBbox(viewportBbox, 1.5);
   const knownType = geomTypes.get(key);
-  const limit = getEffectiveLimit(knownType);
+  const zoom = getMap().getZoom();
+  const limit = getEffectiveLimit(knownType, zoom);
+  const simplify = knownType === "polygon" ? getSimplifyTolerance(zoom) : undefined;
 
   setTreeLayerLoading(ns, layer, true);
   try {
-    const table = await loadLayer(ns, layer, bbox, limit);
+    const table = await loadLayer(ns, layer, fetchBbox, limit, simplify);
     const gt = detectGeomType(table);
     tables.set(key, table);
     geomTypes.set(key, gt);
-    loadedBbox.set(key, bbox);
+    // Store the expanded bbox so bboxContains() has padding for small pans
+    loadedBbox.set(key, fetchBbox);
     updateTreeLayerCount(ns, layer, table.numRows);
 
     // Debug: log schema info for troubleshooting rendering issues
@@ -228,25 +255,24 @@ async function loadLayerWithViewport(
     // If this was the first load and the type is point or line, we used a
     // conservative initial limit.  Re-fetch with the proper higher limit.
     if (!knownType && (gt === "point" || gt === "line")) {
-      const higherLimit = getEffectiveLimit(gt);
+      const higherLimit = getEffectiveLimit(gt, zoom);
       if (table.numRows >= limit && higherLimit > limit) {
         debugLog(`re-fetching ${key} with ${gt} limit (${higherLimit})`);
-        const bigger = await loadLayer(ns, layer, bbox, higherLimit);
+        const bigger = await loadLayer(ns, layer, fetchBbox, higherLimit);
         tables.set(key, bigger);
         geomTypes.set(key, gt);
         updateTreeLayerCount(ns, layer, bigger.numRows);
       }
     }
 
-    // For polygon layers, set a cooldown that prevents moveend from
-    // reloading while earcut triangulation runs inside deck.gl.
-    // Earcut for 10K polygons ≈ 2–5s; we give it 15s of breathing room.
+    // For polygon layers, set a dynamic cooldown that scales with feature count
     if (gt === "polygon") {
+      const cooldown = getEarcutCooldown(table.numRows);
       earcutCooldownKeys.add(key);
       setTimeout(() => {
         earcutCooldownKeys.delete(key);
-        debugLog(`earcut cooldown expired for ${key}`);
-      }, 15_000);
+        debugLog(`earcut cooldown expired for ${key} (${cooldown}ms)`);
+      }, cooldown);
     }
   } catch (e) {
     console.error(`Failed to load ${key}:`, e);
@@ -678,3 +704,103 @@ main().catch((err) => {
   console.error("Webmap initialization failed:", err);
   setStatus(`Error: ${err.message}`);
 });
+
+// ---------------------------------------------------------------------------
+// Tier 3 Agent Integration (feature-flagged — no-op when VITE_AGENT_ENABLED != "true")
+// ---------------------------------------------------------------------------
+
+if (import.meta.env.VITE_AGENT_ENABLED === "true") {
+  import("./agent-ws").then(({ AgentWebSocket }) => {
+    import("./chat-panel").then(({ ChatPanel }) => {
+      const sessionId = crypto.randomUUID();
+      const panel = new ChatPanel(sessionId);
+      let wsClient: InstanceType<typeof AgentWebSocket> | null = null;
+      let panelOpen = false;
+
+      // Debounced layer_ready batching — collect rapid-fire events
+      type LREvent = import("./agent-ws").LayerReadyEvent;
+      let pendingEvents: LREvent[] = [];
+      let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+      function queueLayerReady(event: LREvent) {
+        pendingEvents.push(event);
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(flushPendingLayers, 300);
+      }
+
+      async function flushPendingLayers() {
+        const batch = pendingEvents.splice(0);
+        debounceTimer = null;
+        if (batch.length === 0) return;
+
+        // Load all queued layers in parallel
+        const results = await Promise.allSettled(
+          batch.map(async (event) => {
+            const key = `${event.namespace}/${event.table}`;
+            const arrowTable = await loadLayer(event.namespace, event.table);
+            if (!arrowTable) return null;
+            const geomType = detectGeomType(arrowTable);
+            if (!geomType) return null;
+
+            tables.set(key, arrowTable);
+            geomTypes.set(key, geomType);
+            visibleSet.add(key);
+            updateTreeLayerCount(event.namespace, event.table, event.row_count);
+            return event;
+          }),
+        );
+
+        rebuildLayers();
+        updateStatusBar();
+
+        // Fly to union bbox of all successful loads
+        const bboxes = results
+          .filter(
+            (r): r is PromiseFulfilledResult<LREvent | null> =>
+              r.status === "fulfilled" && r.value?.bbox != null,
+          )
+          .map((r) => r.value!.bbox!);
+        if (bboxes.length > 0) {
+          const union: [number, number, number, number] = [
+            Math.min(...bboxes.map((b) => b[0])),
+            Math.min(...bboxes.map((b) => b[1])),
+            Math.max(...bboxes.map((b) => b[2])),
+            Math.max(...bboxes.map((b) => b[3])),
+          ];
+          flyToBounds(union);
+        }
+      }
+
+      // Create toggle button
+      const toggleBtn = document.createElement("button");
+      toggleBtn.id = "agent-toggle-btn";
+      toggleBtn.textContent = "\u{1F4AC} Agent";
+      document.body.appendChild(toggleBtn);
+
+      toggleBtn.addEventListener("click", () => {
+        panelOpen = !panelOpen;
+        if (panelOpen) {
+          panel.mount(document.body);
+          wsClient = new AgentWebSocket(
+            sessionId,
+            queueLayerReady,
+            (connected) => panel.setAgentStatus(connected),
+          );
+          wsClient.connect();
+          toggleBtn.textContent = "\u2715 Close";
+        } else {
+          panel.unmount();
+          wsClient?.disconnect();
+          wsClient = null;
+          // Clear pending events on panel close
+          pendingEvents = [];
+          if (debounceTimer) {
+            clearTimeout(debounceTimer);
+            debounceTimer = null;
+          }
+          toggleBtn.textContent = "\u{1F4AC} Agent";
+        }
+      });
+    });
+  });
+}

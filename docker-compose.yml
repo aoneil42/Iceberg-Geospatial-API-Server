@@ -116,7 +116,11 @@ services:
       - ./duckdb-init.sql:/config/init.sql:ro
       - ./notebooks:/notebooks
       - duckdb-data:/data
-    mem_limit: 2g
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
     restart: unless-stopped
     depends_on:
       lakekeeper:
@@ -147,7 +151,11 @@ services:
         condition: service_healthy
     networks:
       - lakehouse
-    mem_limit: 2g
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-s", "-o", "/dev/null", "http://localhost:8082/mcp"]
@@ -167,7 +175,17 @@ services:
     environment:
       GARAGE_KEY_ID: "${GARAGE_KEY_ID}"
       GARAGE_SECRET_KEY: "${GARAGE_SECRET_KEY}"
-    mem_limit: 2g
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/docs')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
     depends_on:
       lakekeeper:
@@ -231,7 +249,7 @@ services:
     mem_limit: 256m
     restart: unless-stopped
     depends_on:
-      lakekeeper:
+      api:
         condition: service_healthy
     networks:
       - lakehouse
